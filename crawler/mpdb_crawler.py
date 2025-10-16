@@ -36,7 +36,8 @@ SUPPORTED_CATEGORIES = {
     "sample": "Sample data list",
 }
 
-CSV_FILE_ENCODING = "utf-8-sig"
+CSV_FILE_ENCODING = "utf-8"
+DEFAULT_HTML_ENCODING = "utf-8"
 
 _URL_PATTERN = re.compile(r"(https?://\S+|ftp://\S+|www\.\S+)", re.IGNORECASE)
 
@@ -81,6 +82,7 @@ class MPDBCrawler:
             {
                 "User-Agent": "mpdb-crawler/1.0 (+https://github.com/)",
                 "Accept-Language": lang,
+                "Accept-Charset": DEFAULT_HTML_ENCODING,
             }
         )
 
@@ -102,7 +104,14 @@ class MPDBCrawler:
         logging.info("Fetching data from url: %s, data type: %s", url, dataType)
         response = self.session.get(url, params=params, timeout=self.timeout)
         response.raise_for_status()
-        return response.text
+        encoding = response.encoding or response.apparent_encoding or DEFAULT_HTML_ENCODING
+        if encoding.lower() == "iso-8859-1":
+            encoding = DEFAULT_HTML_ENCODING
+        try:
+            return response.content.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            logging.debug("Failed to decode %s with %s; falling back to %s", url, encoding, DEFAULT_HTML_ENCODING)
+            return response.content.decode(DEFAULT_HTML_ENCODING, errors="replace")
 
     def _crawl_category(
         self,
