@@ -38,6 +38,47 @@ SUPPORTED_CATEGORIES = {
 
 CSV_FILE_ENCODING = "utf-8"
 DEFAULT_HTML_ENCODING = "utf-8"
+HTTP_ERROR_LOG_TEMPLATE = "crawler_http_errors_{category}.log"
+CRUDEDRUG_JP_DATA_FIELDS = {
+    "gene data",
+    "identification",
+    "identification (tlc)",
+    "loss on drying",
+    "total ash",
+    "acid-insoluble ash",
+    "extract content",
+    "essential oil content",
+    "purity",
+    "other",
+}
+
+logger = logging.getLogger(__name__)
+_HTTP_ERROR_LOGGERS: Dict[str, logging.Logger] = {}
+
+
+def _normalise_log_category(category: Optional[str]) -> str:
+    base = (category or "general").strip().lower()
+    cleaned = re.sub(r"[^\w]+", "_", base)
+    cleaned = cleaned.strip("_")
+    return cleaned or "general"
+
+
+def _get_http_logger(category: Optional[str]) -> logging.Logger:
+    normalized = _normalise_log_category(category)
+    cached = _HTTP_ERROR_LOGGERS.get(normalized)
+    if cached:
+        return cached
+    logger_name = f"{__name__}.http.{normalized}"
+    http_logger = logging.getLogger(logger_name)
+    if not http_logger.handlers:
+        log_path = Path(HTTP_ERROR_LOG_TEMPLATE.format(category=normalized))
+        handler = logging.FileHandler(log_path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        http_logger.addHandler(handler)
+    http_logger.setLevel(logging.ERROR)
+    http_logger.propagate = False
+    _HTTP_ERROR_LOGGERS[normalized] = http_logger
+    return http_logger
 
 _URL_PATTERN = re.compile(r"(https?://\S+|ftp://\S+|www\.\S+)", re.IGNORECASE)
 
@@ -95,15 +136,29 @@ class MPDBCrawler:
         results: List[CrawlResult] = []
         for category in categories:
             logging.info("Crawling category '%s'", category)
-            items, headers = self._crawl_category(category, include_details=include_details, limit=limit)
+            try:
+                items, headers = self._crawl_category(category, include_details=include_details, limit=limit)
+            except requests.RequestException as exc:
+                logging.error("Skipping category '%s' due to HTTP error: %s", category, exc)
+                continue
+            except Exception as exc:  # pragma: no cover - defensive
+                logging.error("Skipping category '%s' due to unexpected error: %s", category, exc, exc_info=True)
+                continue
             results.append(CrawlResult(category=category, columns=headers, items=items))
         return results
 
-    def _fetch(self, url: str, dataType: str, params: Optional[Dict] = None) -> str:
+    def _fetch(self, url: str, dataType: str, params: Optional[Dict] = None, category: Optional[str] = None) -> str:
         """Fetch raw HTML, raising for HTTP errors."""
         logging.info("Fetching data from url: %s, data type: %s", url, dataType)
-        response = self.session.get(url, params=params, timeout=self.timeout)
-        response.raise_for_status()
+        try:
+            response = self.session.get(url, params=params, timeout=self.timeout)
+            response.raise_for_status()
+        except requests.Timeout as exc:
+            self._log_http_error("timeout", url, exc, {"params": params, "data_type": dataType}, category=category)
+            raise
+        except requests.RequestException as exc:
+            self._log_http_error("http_error", url, exc, {"params": params, "data_type": dataType}, category=category)
+            raise
         encoding = response.encoding or response.apparent_encoding or DEFAULT_HTML_ENCODING
         if encoding.lower() == "iso-8859-1":
             encoding = DEFAULT_HTML_ENCODING
@@ -121,7 +176,7 @@ class MPDBCrawler:
     ) -> Tuple[List[Dict], List[str]]:
         """Return table entries and column order for a single category."""
         url = urljoin(BASE_URL, LIST_ENDPOINT)
-        html = self._fetch(url, 'Category', params={"category": category, "lang": self.lang})
+        html = self._fetch(url, 'Category', params={"category": category, "lang": self.lang}, category=category)
         soup = BeautifulSoup(html, "html.parser")
 
         table = soup.find("table", class_="list")
@@ -180,13 +235,13 @@ class MPDBCrawler:
 
             if include_details and detail_url:
                 time.sleep(self.delay)
-                detail_data = self._filter_detail_fields(category, self._fetch_detail(detail_url))
+                detail_data = self._filter_detail_fields(category, self._fetch_detail(detail_url, category=category))
                 entry["detail"] = detail_data
 
             if self.download_photos and detail_url:
                 if detail_data is None:
                     time.sleep(self.delay)
-                    detail_data = self._filter_detail_fields(category, self._fetch_detail(detail_url))
+                    detail_data = self._filter_detail_fields(category, self._fetch_detail(detail_url, category=category))
                     if include_details:
                         entry["detail"] = detail_data
                 photos = detail_data.get("photos") if detail_data else None
@@ -207,9 +262,13 @@ class MPDBCrawler:
 
         return items, headers
 
-    def _fetch_detail(self, detail_url: str) -> Dict[str, object]:
+    def _fetch_detail(self, detail_url: str, category: Optional[str] = None) -> Dict[str, object]:
         """Fetch and parse a detail page into structured rows."""
-        html = self._fetch(detail_url, 'Detail')
+        try:
+            html = self._fetch(detail_url, 'Detail', category=category)
+        except requests.RequestException as exc:
+            logging.warning("Skipping detail page %s due to HTTP error: %s", detail_url, exc)
+            return {}
         soup = BeautifulSoup(html, "html.parser")
         detail_table = soup.find("table", class_="detail")
         if detail_table is None:
@@ -255,7 +314,11 @@ class MPDBCrawler:
                 library_photos: List[Dict[str, object]] = []
                 for link in links:
                     time.sleep(self.delay)
-                    library_photos.extend(self._fetch_photo_library(link["url"]))
+                    try:
+                        library_photos.extend(self._fetch_photo_library(link["url"], category=category))
+                    except requests.RequestException as exc:
+                        logging.warning("Skipping photo library %s due to HTTP error: %s", link["url"], exc)
+                        continue
                 if library_photos:
                     for photo in library_photos:
                         photo_entries.append({"source": "library", **photo})
@@ -277,19 +340,157 @@ class MPDBCrawler:
     @staticmethod
     def _filter_detail_fields(category: str, detail: Optional[Dict[str, object]]) -> Optional[Dict[str, object]]:
         """Remove unwanted fields from detail payloads."""
-        if category != "plant" or not isinstance(detail, dict):
+        if not isinstance(detail, dict):
             return detail
-        rows = detail.get("rows")
-        if isinstance(rows, list):
-            detail["rows"] = [
-                row
-                for row in rows
-                if not (
-                    isinstance(row, dict)
-                    and _is_resource_field(category, row.get("label"))
-                )
-            ]
+        if category == "plant":
+            rows = detail.get("rows")
+            if isinstance(rows, list):
+                detail["rows"] = [
+                    row
+                    for row in rows
+                    if not (
+                        isinstance(row, dict)
+                        and _is_resource_field(category, row.get("label"))
+                    )
+                ]
+        if category == "crudedrug":
+            MPDBCrawler._flatten_crudedrug_jp_data(detail)
         return detail
+
+    @staticmethod
+    def _flatten_crudedrug_jp_data(detail: Dict[str, object]) -> None:
+        """Flatten JP data rows so all entries land in a single field."""
+        rows = detail.get("rows")
+        if not isinstance(rows, list):
+            return
+
+        jp_row_index: Optional[int] = None
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            label = row.get("label")
+            if isinstance(label, str) and label.strip().lower() == "jp data":
+                jp_row_index = index
+                break
+        if jp_row_index is None:
+            return
+
+        jp_row = rows[jp_row_index]
+        aggregated_texts = MPDBCrawler._collect_detail_texts(jp_row)
+        aggregated_links = list(MPDBCrawler._extract_detail_links(jp_row))
+        consumed_indexes: List[int] = []
+
+        for index, row in enumerate(rows):
+            if index == jp_row_index:
+                continue
+            if not isinstance(row, dict):
+                continue
+            if row.get("label"):
+                continue
+            texts = MPDBCrawler._collect_detail_texts(row)
+            if not texts:
+                continue
+            first_token = MPDBCrawler._normalise_detail_token(texts[0])
+            if not first_token or first_token not in CRUDEDRUG_JP_DATA_FIELDS:
+                continue
+            consumed_indexes.append(index)
+            aggregated_texts.extend(texts)
+            aggregated_links.extend(MPDBCrawler._extract_detail_links(row))
+
+        if not consumed_indexes:
+            return
+
+        combined_texts = MPDBCrawler._deduplicate_tokens(aggregated_texts)
+        unique_links = MPDBCrawler._deduplicate_links(aggregated_links)
+
+        if combined_texts:
+            jp_row["value"] = {"text": "; ".join(combined_texts)}
+        else:
+            jp_row["value"] = None
+
+        jp_row["links"] = unique_links
+        if isinstance(jp_row["value"], dict):
+            jp_row["value"]["links"] = unique_links or None
+
+        for index in sorted(consumed_indexes, reverse=True):
+            del rows[index]
+
+    @staticmethod
+    def _collect_detail_texts(row: Dict[str, object]) -> List[str]:
+        texts: List[str] = []
+        texts.extend(MPDBCrawler._value_to_strings(row.get("value")))
+        for link in row.get("links") or []:
+            if not isinstance(link, dict):
+                continue
+            text = normalise_text(link.get("text") or "")
+            if text:
+                texts.append(text)
+        return texts
+
+    @staticmethod
+    def _extract_detail_links(row: Dict[str, object]) -> List[Dict[str, Optional[str]]]:
+        links: List[Dict[str, Optional[str]]] = []
+        for link in row.get("links") or []:
+            if not isinstance(link, dict):
+                continue
+            text = normalise_text(link.get("text") or "")
+            url = link.get("url")
+            if text or url:
+                links.append({"text": text or None, "url": url})
+        return links
+
+    @staticmethod
+    def _normalise_detail_token(value: str) -> str:
+        return normalise_text(value).lower()
+
+    @staticmethod
+    def _value_to_strings(value: object) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            text = normalise_text(value)
+            return [text] if text else []
+        if isinstance(value, dict):
+            text = normalise_text(value.get("text") or "")
+            return [text] if text else []
+        if isinstance(value, list):
+            collected: List[str] = []
+            for item in value:
+                collected.extend(MPDBCrawler._value_to_strings(item))
+            return collected
+        text = normalise_text(str(value))
+        return [text] if text else []
+
+    @staticmethod
+    def _deduplicate_tokens(tokens: Iterable[str]) -> List[str]:
+        ordered: List[str] = []
+        seen: Set[str] = set()
+        for token in tokens:
+            normalized = normalise_text(token)
+            if not normalized:
+                continue
+            key = normalized.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(normalized)
+        return ordered
+
+    @staticmethod
+    def _deduplicate_links(links: Iterable[Dict[str, Optional[str]]]) -> List[Dict[str, Optional[str]]]:
+        ordered: List[Dict[str, Optional[str]]] = []
+        seen: Set[Tuple[Optional[str], Optional[str]]] = set()
+        for link in links:
+            if not isinstance(link, dict):
+                continue
+            text = normalise_text(link.get("text") or "")
+            url = link.get("url")
+            key = (text or None, url)
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append({"text": text or None, "url": url})
+        return ordered
 
     @staticmethod
     def _extract_links(cell) -> List[Dict[str, str]]:
@@ -332,9 +533,9 @@ class MPDBCrawler:
             )
         return images
 
-    def _fetch_photo_library(self, photo_page_url: str) -> List[Dict[str, object]]:
+    def _fetch_photo_library(self, photo_page_url: str, category: Optional[str] = None) -> List[Dict[str, object]]:
         """Fetch photo library entries from the dedicated plant photo page."""
-        html = self._fetch(photo_page_url, 'PhotoLibrary')
+        html = self._fetch(photo_page_url, 'PhotoLibrary', category=category)
         soup = BeautifulSoup(html, "html.parser")
         photo_main = soup.find("table", class_="photo_main")
         if photo_main is None:
@@ -475,14 +676,19 @@ class MPDBCrawler:
                 continue
 
             time.sleep(self.delay)
-            self._download_file(url, destination)
+            self._download_file(url, destination, category=category)
 
-    def _download_file(self, url: str, destination: Path) -> None:
+    def _download_file(self, url: str, destination: Path, category: Optional[str] = None) -> None:
         """Download binary content to a destination path."""
         try:
             response = self.session.get(url, timeout=self.timeout)
             response.raise_for_status()
+        except requests.Timeout as exc:
+            self._log_http_error("timeout_download", url, exc, {"destination": str(destination)}, category=category)
+            logging.warning("Failed to download %s: %s", url, exc)
+            return
         except requests.RequestException as exc:
+            self._log_http_error("http_error_download", url, exc, {"destination": str(destination)}, category=category)
             logging.warning("Failed to download %s: %s", url, exc)
             return
 
@@ -490,6 +696,24 @@ class MPDBCrawler:
         with destination.open("wb") as handle:
             handle.write(response.content)
         logging.info("Downloaded photo -> %s", destination)
+
+    def _log_http_error(
+        self,
+        stage: str,
+        url: str,
+        exc: BaseException,
+        extra: Optional[Dict[str, object]] = None,
+        category: Optional[str] = None,
+    ) -> None:
+        """Persist HTTP issues so transient failures can be inspected later."""
+        http_logger = _get_http_logger(category)
+        http_logger.error(url)
+
+        context_parts = [f"stage={stage}", f"url={url}", f"category={_normalise_log_category(category)}"]
+        if extra:
+            for key, value in extra.items():
+                context_parts.append(f"{key}={value!r}")
+        logger.debug("HTTP failure recorded: %s :: %s", " ".join(context_parts), exc, exc_info=True)
 
 
 def _strip_urls(text: str) -> str:
@@ -537,8 +761,11 @@ def flatten_detail_row(row: Dict[str, object]) -> str:
     parts: List[str] = []
 
     value = row.get("value")
+    value_str = ""
     if value:
-        parts.append(cell_to_string(value))
+        value_str = cell_to_string(value)
+        if value_str:
+            parts.append(value_str)
 
     link_entries = row.get("links") or []
     link_strings: List[str] = []
@@ -549,7 +776,21 @@ def flatten_detail_row(row: Dict[str, object]) -> str:
         if text:
             link_strings.append(text)
     if link_strings:
-        parts.append("; ".join(link_strings))
+        cleaned_links: List[str] = []
+        seen_links: Set[str] = set()
+        value_tokens: Set[str] = {
+            normalise_text(token).lower()
+            for token in re.split(r"[;|]", value_str)
+            if token.strip()
+        } if value_str else set()
+        for link_text in link_strings:
+            normalized = normalise_text(link_text).lower()
+            if not normalized or normalized in value_tokens or normalized in seen_links:
+                continue
+            seen_links.add(normalized)
+            cleaned_links.append(link_text)
+        if cleaned_links:
+            parts.append("; ".join(cleaned_links))
 
     image_entries = row.get("images") or []
     image_strings: List[str] = []
@@ -762,11 +1003,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         photo_root=args.photo_dir,
     )
 
+    results: List[CrawlResult] = []
     try:
         results = crawler.crawl(categories=categories, include_details=args.include_details, limit=args.limit)
     except requests.HTTPError as exc:
-        logging.error("HTTP error encountered: %s", exc)
-        return 1
+        logging.error("HTTP error encountered while crawling: %s", exc)
+        logging.info("Continuing without data for the failing request.")
     except Exception as exc:  # pragma: no cover - defensive
         logging.error("Unexpected error: %s", exc, exc_info=args.verbose)
         return 1
