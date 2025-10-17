@@ -34,6 +34,7 @@ SUPPORTED_CATEGORIES = {
     "syohou": "Kampo formula data list",
     "compound": "Compound data list",
     "sample": "Sample data list",
+    "tlc": "TLC data list",
     "lcms": "LC/GC-MS data list",
     "jp_identification": "JP identification list",
     "gene": "Gene data list",
@@ -143,6 +144,8 @@ class MPDBCrawler:
             try:
                 if category == "lcms":
                     items, headers = self._crawl_lcms(limit=limit)
+                elif category == "tlc":
+                    items, headers = self._crawl_tlc(include_details=include_details, limit=limit)
                 elif category == "jp_identification":
                     crudedrug_cache = category_cache.get("crudedrug_details")
                     items, headers = self._crawl_jp_identification(limit=limit, crudedrug_cache=crudedrug_cache)
@@ -550,6 +553,97 @@ class MPDBCrawler:
                 if identifier:
                     self._download_photos_for_category("lcms", identifier, photos)
 
+        if include_photo_column and "Detail photos" not in headers:
+            headers.append("Detail photos")
+
+        return items, headers
+
+    def _crawl_tlc(
+        self,
+        include_details: bool,
+        limit: Optional[int],
+    ) -> Tuple[List[Dict], List[str]]:
+        max_id = 798
+        base_headers = ["TLC ID", "TLC link"]
+        labelled_headers: List[str] = []
+        max_unlabelled_rows = 0
+        include_photo_column = False
+        items: List[Dict] = []
+
+        for tlc_id in range(1, max_id + 1):
+            if limit and len(items) >= limit:
+                break
+
+            detail_url = f"{BASE_URL}/mpdb-bin/view_tlc_data.cgi?id={tlc_id}&lang={self.lang}"
+            time.sleep(self.delay)
+            try:
+                detail = self._fetch_detail(detail_url, category="tlc")
+            except requests.RequestException as exc:
+                logging.warning("Skipping TLC ID %s due to HTTP error: %s", tlc_id, exc)
+                continue
+
+            if not detail or not detail.get("rows"):
+                continue
+
+            row_columns: Dict[str, object] = {
+                "TLC ID": str(tlc_id),
+                "TLC link": detail_url,
+            }
+
+            rows = detail.get("rows") or []
+            unlabeled_index = 1
+            for row in rows:
+                flattened = flatten_detail_row(row)
+                if not flattened:
+                    continue
+                label = row.get("label")
+                if label:
+                    header_name = normalise_text(str(label))
+                    if not header_name:
+                        header_name = f"Field {unlabeled_index}"
+                        unlabeled_index += 1
+                    existing_value = row_columns.get(header_name)
+                    if existing_value:
+                        existing_text = cell_to_string(existing_value)
+                        if flattened not in existing_text:
+                            row_columns[header_name] = f"{existing_text} | {flattened}"
+                    else:
+                        row_columns[header_name] = flattened
+                    if header_name not in labelled_headers and header_name not in base_headers:
+                        labelled_headers.append(header_name)
+                else:
+                    column_name = f"Unlabelled detail {unlabeled_index}"
+                    row_columns[column_name] = flattened
+                    unlabeled_index += 1
+
+            if unlabeled_index - 1 > max_unlabelled_rows:
+                max_unlabelled_rows = unlabeled_index - 1
+
+            photos = detail.get("photos") or []
+            if photos:
+                include_photo_column = True
+                row_columns.setdefault("Detail photos", flatten_photo_entries(photos))
+                if "Detail photos" not in labelled_headers and "Detail photos" not in base_headers:
+                    labelled_headers.append("Detail photos")
+
+            item_payload: Dict[str, object] = {"columns": row_columns}
+            if include_details or self.download_photos:
+                item_payload["detail"] = detail
+
+            items.append(item_payload)
+
+            if self.download_photos and photos:
+                identifier = str(tlc_id)
+                self._download_photos_for_category("tlc", identifier, photos)
+
+        headers = base_headers.copy()
+        for header in labelled_headers:
+            if header not in headers:
+                headers.append(header)
+        for index in range(1, max_unlabelled_rows + 1):
+            column_name = f"Unlabelled detail {index}"
+            if column_name not in headers:
+                headers.append(column_name)
         if include_photo_column and "Detail photos" not in headers:
             headers.append("Detail photos")
 
@@ -1698,7 +1792,12 @@ def write_csv_result(result: CrawlResult, handle: TextIO) -> None:
             label = row.get("label")
             if label:
                 label_str = cell_to_string(label)
-                if label_str and not _should_skip_column(label_str, result.category) and label_str not in seen_detail_labels:
+                if (
+                    label_str
+                    and not _should_skip_column(label_str, result.category)
+                    and label_str not in seen_detail_labels
+                    and label_str not in base_fieldnames
+                ):
                     detail_columns.append(label_str)
                     seen_detail_labels.add(label_str)
             else:
@@ -1713,7 +1812,7 @@ def write_csv_result(result: CrawlResult, handle: TextIO) -> None:
     fieldnames = base_fieldnames.copy()
     fieldnames.extend(detail_columns)
     fieldnames.extend(unlabelled_columns)
-    if include_photo_column:
+    if include_photo_column and "Detail photos" not in fieldnames:
         fieldnames.append("Detail photos")
 
     writer = csv.DictWriter(handle, fieldnames=fieldnames)
