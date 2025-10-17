@@ -36,6 +36,7 @@ SUPPORTED_CATEGORIES = {
     "sample": "Sample data list",
     "lcms": "LC/GC-MS data list",
     "jp_identification": "JP identification list",
+    "gene": "Gene data list",
 }
 
 CSV_FILE_ENCODING = "utf-8"
@@ -234,7 +235,8 @@ class MPDBCrawler:
                 header_row = table.find("tr")
             if header_row:
                 table_headers = [
-                    normalise_text(cell.get_text(" ", strip=True)) for cell in header_row.find_all(["th", "td"])
+                    normalise_text(cell.get_text(" ", strip=True))
+                    for cell in header_row.find_all(["th", "td"], recursive=False)
                 ]
 
         skip_column_indexes: Set[int] = set()
@@ -254,6 +256,8 @@ class MPDBCrawler:
 
         data_rows: List = []
         for tr in candidate_rows:
+            if tr.find_parent("table") is not table:
+                continue
             if header_row is not None and tr is header_row:
                 continue
             row_class = tr.get("class") or []
@@ -270,7 +274,7 @@ class MPDBCrawler:
             return items, headers
 
         for tr in data_rows:
-            cells = tr.find_all("td")
+            cells = tr.find_all("td", recursive=False)
             if not cells:
                 continue
 
@@ -305,6 +309,21 @@ class MPDBCrawler:
                     row_data[header] = {"text": value_text or None, "links": links}
                 else:
                     row_data[header] = value_text or None
+
+                if category == "gene" and header.strip().lower() == "genetical information":
+                    gene_link = next((link for link in links if link.get("url")), None)
+                    gene_detail_url = gene_link.get("url") if isinstance(gene_link, dict) else None
+                    if not gene_detail_url:
+                        anchor = cell.find("a", href=True)
+                        if anchor:
+                            gene_detail_url = urljoin(BASE_URL, anchor.get("href", ""))
+                    if gene_detail_url:
+                        detail_url = gene_detail_url
+                        candidate_id = self._extract_id(detail_url)
+                        if candidate_id:
+                            entry_id = candidate_id
+                            if not row_data.get("ID"):
+                                row_data["ID"] = candidate_id
 
             entry: Dict[str, object] = {"columns": row_data}
             if detail_url:
@@ -1426,6 +1445,7 @@ class MPDBCrawler:
             "crudedrug": ["view_crude_drug"],
             "compound": ["view_compound"],
             "lcms": ["view_lcgc"],
+            "gene": ["view_gene"],
         }
         preferred_keywords = category_preferences.get(category, [])
 
