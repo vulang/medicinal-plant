@@ -174,6 +174,8 @@ class MPDBCrawler:
         include_details: bool = False,
         limit: Optional[int] = None,
     ) -> Tuple[List[Dict], List[str]]:
+        if category == "compound":
+            return self._crawl_compound(include_details=include_details, limit=limit)
         """Return table entries and column order for a single category."""
         url = urljoin(BASE_URL, LIST_ENDPOINT)
         html = self._fetch(url, 'Category', params={"category": category, "lang": self.lang}, category=category)
@@ -183,7 +185,30 @@ class MPDBCrawler:
         if table is None:
             raise RuntimeError(f"Unable to locate data table for category '{category}'.")
 
+        items, headers = self._parse_table_rows(
+            table=table,
+            category=category,
+            include_details=include_details,
+            limit=limit,
+            existing_items=[],
+        )
+        return items, headers
+
+    def _parse_table_rows(
+        self,
+        table,
+        category: str,
+        include_details: bool,
+        limit: Optional[int],
+        existing_items: List[Dict],
+    ) -> Tuple[List[Dict], List[str]]:
         table_headers = [normalise_text(th.get_text(" ", strip=True)) for th in table.select("thead tr th")]
+        if not table_headers:
+            header_row = table.find("tr", class_="label")
+            if header_row:
+                table_headers = [
+                    normalise_text(td.get_text(" ", strip=True)) for td in header_row.find_all("td")
+                ]
         skip_column_indexes: Set[int] = set()
         filtered_headers: List[str] = []
         for idx, header in enumerate(table_headers):
@@ -192,20 +217,24 @@ class MPDBCrawler:
                 continue
             filtered_headers.append(header)
         headers = filtered_headers if "ID" in filtered_headers else ["ID"] + filtered_headers
+
         items: List[Dict] = []
         tbody = table.find("tbody")
         if not tbody:
             logging.warning("No table body found for category '%s'", category)
             return items, headers
 
-        for row_idx, tr in enumerate(tbody.find_all("tr"), start=1):
+        for tr in tbody.find_all("tr"):
+            row_class = tr.get("class") or []
+            if "label" in row_class:
+                continue
             cells = tr.find_all("td")
             if not cells:
                 continue
 
             detail_data: Optional[Dict[str, object]] = None
             row_data: Dict[str, object] = {}
-            detail_link = tr.find("a", href=True)
+            detail_link = self._select_detail_link(tr, category)
             detail_url = urljoin(BASE_URL, detail_link["href"]) if detail_link else None
             entry_id = None
             if detail_url:
@@ -227,7 +256,8 @@ class MPDBCrawler:
                 else:
                     row_data[header] = value_text or None
 
-            entry: Dict[str, object] = {"row_number": row_idx, "columns": row_data}
+            row_number = len(existing_items) + len(items) + 1
+            entry: Dict[str, object] = {"row_number": row_number, "columns": row_data}
             if detail_url:
                 entry["detail_url"] = detail_url
             if entry_id and "id" not in entry:
@@ -252,14 +282,83 @@ class MPDBCrawler:
 
             items.append(entry)
 
-            if limit and len(items) >= limit:
+            if limit and len(existing_items) + len(items) >= limit:
                 logging.info("Hit limit (%s) for category '%s'", limit, category)
                 break
 
-            if (include_details and detail_url) or (self.download_photos and detail_url):
+            if detail_url and (include_details or self.download_photos):
                 continue  # delay already applied
             time.sleep(self.delay)
 
+        return items, headers
+
+    def _crawl_compound(
+        self,
+        include_details: bool = False,
+        limit: Optional[int] = None,
+    ) -> Tuple[List[Dict], List[str]]:
+        segments = ["A-C", "D-F", "G-I", "J-L", "M-P", "Q-S", "T-V", "W-Z"]
+        items: List[Dict] = []
+        headers: Optional[List[str]] = None
+
+        menu_html = self._fetch(
+            urljoin(BASE_URL, "/mpdb-bin/search.cgi"),
+            "Compound menu",
+            params={"category": "compound", "mode": "menu", "lang": self.lang},
+            category="compound",
+        )
+        soup = BeautifulSoup(menu_html, "html.parser")
+        token = self._extract_token_from_soup(soup)
+        if not token:
+            raise RuntimeError("Unable to retrieve compound search token.")
+
+        for segment in segments:
+            if limit and len(items) >= limit:
+                break
+
+            payload = {
+                "mode": "search_alphabet",
+                "selectBtn": segment,
+                "category": "compound",
+                "lang": self.lang,
+                "token": token,
+            }
+            logging.info("Fetching compound range '%s'", segment)
+            response = self.session.post(
+                urljoin(BASE_URL, "/mpdb-bin/search.cgi"),
+                data=payload,
+                timeout=self.timeout,
+            )
+            try:
+                response.raise_for_status()
+            except requests.RequestException as exc:
+                logging.warning("Skipping compound range '%s' due to HTTP error: %s", segment, exc)
+                continue
+
+            segment_soup = BeautifulSoup(response.text, "html.parser")
+            table = segment_soup.find("table", class_="list")
+            if not table:
+                logging.warning("No compound data table found for range '%s'", segment)
+                token = self._extract_token_from_soup(segment_soup) or token
+                continue
+
+            new_items, seg_headers = self._parse_table_rows(
+                table=table,
+                category="compound",
+                include_details=include_details,
+                limit=limit,
+                existing_items=items,
+            )
+            if headers is None:
+                headers = seg_headers
+            items.extend(new_items)
+            token = self._extract_token_from_soup(segment_soup) or token
+
+            if limit and len(items) >= limit:
+                break
+
+        if headers is None:
+            headers = []
         return items, headers
 
     def _fetch_detail(self, detail_url: str, category: Optional[str] = None) -> Dict[str, object]:
@@ -623,9 +722,46 @@ class MPDBCrawler:
             compound_name = self._value_to_text(row_data.get("Compound name"))
             if not compound_name:
                 compound_name = self._find_detail_value(detail, "Compound name")
+            if compound_name:
+                compound_name = re.sub(r"\s*\([^)]*\)", "", compound_name).strip()
             return compound_name or self._value_to_text(row_data.get("ID"))
 
         return self._value_to_text(row_data.get("ID"))
+
+    @staticmethod
+    def _extract_token_from_soup(soup: BeautifulSoup) -> Optional[str]:
+        token_input = soup.find("input", {"name": "token"})
+        if not token_input:
+            return None
+        value = token_input.get("value")
+        return value.strip() if value else None
+
+    @staticmethod
+    def _select_detail_link(row, category: str):
+        anchors = row.find_all("a", href=True)
+        if not anchors:
+            return None
+
+        category_preferences = {
+            "plant": ["view_plant"],
+            "sample": ["view_sample"],
+            "crudedrug": ["view_crude_drug"],
+            "compound": ["view_compound"],
+        }
+        preferred_keywords = category_preferences.get(category, [])
+
+        for keyword in preferred_keywords:
+            for anchor in anchors:
+                href = anchor.get("href", "")
+                if keyword in href:
+                    return anchor
+
+        for anchor in anchors:
+            href = anchor.get("href", "")
+            if "view_" in href:
+                return anchor
+
+        return anchors[0]
 
     @staticmethod
     def _extract_id(url: str) -> Optional[str]:
