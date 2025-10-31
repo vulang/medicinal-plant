@@ -4,7 +4,7 @@ Command line crawler for the Comprehensive Medicinal Plant Database (MPDB) hoste
 
 ## Features
 
-- Fetch list data for categories such as `plant`, `crudedrug`, `jplist`, `syohou`, `compound`, and `sample`.
+- Fetch list data for categories such as `plant`, `crudedrug`, `jplist`, `syohou`, `compound`, `sample`, `gene`, `lcms`, `jp_identification`, and `jp_assay`.
 - Output scraped content as JSON (default) or CSV, with CSV helpers that flatten nested link information.
 - Follow detail pages (`--include-details`) to capture structured rows, links, and images.
 - Download photo assets for plants, samples, or compounds into a predictable directory tree.
@@ -82,3 +82,4 @@ Photos (when enabled) are stored under `photos/<category>/<identifier>/` where t
 
 - The script respects polite crawling defaults but you remain responsible for complying with MPDB usage policies.
 - Network failures or server-side protections can surface as `requests` exceptions; rerunning with `-v` can help diagnose issues.
+- `jp_identification` and `jp_assay` lack list views; the crawler requests detail pages directly (IDs 1-676 for identification, 1-50 for assay).

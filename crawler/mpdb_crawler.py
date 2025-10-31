@@ -24,11 +24,13 @@ from urllib.parse import parse_qs, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
+from plant_crawler import crawl_plant
+
 
 BASE_URL = "http://mpdb.nibiohn.go.jp"
 LIST_ENDPOINT = "/mpdb-bin/list_data.cgi"
 SUPPORTED_CATEGORIES = {
-    "plant": "Plant data list",
+    "plant": "Plant data list (reference crawler)",
     "crudedrug": "Crude drug data list",
     "jplist": "JP crude drug list",
     "syohou": "Kampo formula data list",
@@ -37,6 +39,7 @@ SUPPORTED_CATEGORIES = {
     "tlc": "TLC data list",
     "lcms": "LC/GC-MS data list",
     "jp_identification": "JP identification list",
+    "jp_assay": "JP assay list",
     "gene": "Gene data list",
 }
 
@@ -85,6 +88,10 @@ def _get_http_logger(category: Optional[str]) -> logging.Logger:
     return http_logger
 
 _URL_PATTERN = re.compile(r"(https?://\S+|ftp://\S+|www\.\S+)", re.IGNORECASE)
+_JP_IDENT_PHOTO_URL_PATTERN = re.compile(
+    r"get_image\.cgi\?table=jp_identification_photo_data&column=jp_identification_photo_file&id=(\d+)",
+    re.IGNORECASE,
+)
 
 
 def _is_resource_field(category: str, name: Optional[str]) -> bool:
@@ -142,13 +149,24 @@ class MPDBCrawler:
         for category in categories:
             logging.info("Crawling category '%s'", category)
             try:
-                if category == "lcms":
+                if category == "plant":
+                    items, headers = crawl_plant(self, include_details=include_details, limit=limit)
+                    category_cache[category] = {
+                        "items": items,
+                        "headers": headers,
+                        "include_details": include_details,
+                        "limit": limit,
+                    }
+                elif category == "lcms":
                     items, headers = self._crawl_lcms(limit=limit)
                 elif category == "tlc":
                     items, headers = self._crawl_tlc(include_details=include_details, limit=limit)
                 elif category == "jp_identification":
                     crudedrug_cache = category_cache.get("crudedrug_details")
                     items, headers = self._crawl_jp_identification(limit=limit, crudedrug_cache=crudedrug_cache)
+                elif category == "jp_assay":
+                    crudedrug_cache = category_cache.get("crudedrug_details")
+                    items, headers = self._crawl_jp_assay(limit=limit, crudedrug_cache=crudedrug_cache)
                 else:
                     items, headers = self._crawl_category(category, include_details=include_details, limit=limit)
                     category_cache[category] = {
@@ -249,6 +267,8 @@ class MPDBCrawler:
             if _is_resource_field(category, header_name):
                 skip_column_indexes.add(idx)
                 continue
+            if category == "plant" and (header_name or "").strip().lower() == "growing data":
+                continue
             filtered_headers.append(header_name)
 
         dynamic_headers: List[str] = filtered_headers.copy()
@@ -294,10 +314,30 @@ class MPDBCrawler:
             for column_index, cell in enumerate(cells):
                 header = table_headers[column_index] if column_index < len(table_headers) else f"Column {column_index + 1}"
                 header = header or f"Column {column_index + 1}"
+                normalized_header = header.strip().lower()
                 if column_index < len(table_headers):
                     if column_index in skip_column_indexes:
                         continue
                 elif _is_resource_field(category, header):
+                    continue
+                if category == "plant" and normalized_header == "growing data":
+                    growing_rows = self._extract_growing_data_rows(cell)
+                    if growing_rows:
+                        for growing_row in growing_rows:
+                            label = growing_row.get("label")
+                            if not label:
+                                continue
+                            value = MPDBCrawler._value_to_text(growing_row.get("value"))
+                            row_data[label] = value
+                            if label not in dynamic_headers:
+                                dynamic_headers.append(label)
+                        continue
+                    # Fallback: no structured data extracted.
+                    value_text = normalise_text(cell.get_text(" ", strip=True))
+                    if value_text:
+                        row_data[header] = value_text
+                        if header not in dynamic_headers:
+                            dynamic_headers.append(header)
                     continue
                 if header not in dynamic_headers:
                     dynamic_headers.append(header)
@@ -654,112 +694,212 @@ class MPDBCrawler:
         limit: Optional[int],
         crudedrug_cache: Optional[Dict[str, object]],
     ) -> Tuple[List[Dict], List[str]]:
-        crudedrug_items: List[Dict] = []
-        if crudedrug_cache:
-            crudedrug_items = list(crudedrug_cache.get("items") or [])
+        return self._crawl_jp_entry_type(limit=limit, crudedrug_cache=crudedrug_cache, entry_kind="identification")
 
-        if not crudedrug_items:
-            logging.info("Fetching crudedrug data to derive JP identification entries.")
-            crudedrug_items, _ = self._crawl_category("crudedrug", include_details=True, limit=None)
+    def _crawl_jp_assay(
+        self,
+        limit: Optional[int],
+        crudedrug_cache: Optional[Dict[str, object]],
+    ) -> Tuple[List[Dict], List[str]]:
+        return self._crawl_jp_entry_type(limit=limit, crudedrug_cache=crudedrug_cache, entry_kind="assay")
 
-        jp_entries: Dict[str, Dict[str, object]] = {}
+    def _crawl_jp_entry_type(
+        self,
+        *,
+        limit: Optional[int],
+        crudedrug_cache: Optional[Dict[str, object]],
+        entry_kind: str,
+    ) -> Tuple[List[Dict], List[str]]:
+        config_map = {
+            "identification": {
+                "category_key": "jp_identification",
+                "detail_data_type": "JPIdentificationDetail",
+                "photo_data_type": "JPIdentificationPhoto",
+                "prefix": "JP identification",
+                "include_sources": False,
+                "id_range": range(1, 677),
+            },
+            "assay": {
+                "category_key": "jp_assay",
+                "detail_data_type": "JPAssayDetail",
+                "photo_data_type": "JPAssayPhoto",
+                "prefix": "JP assay",
+                "include_sources": False,
+                "id_range": range(1, 51),
+            },
+        }
+        config = config_map.get(entry_kind)
+        if not config:
+            raise ValueError(f"Unsupported JP entry kind: {entry_kind}")
+
         detail_field_order: List[str] = []
+        include_sources = config.get("include_sources", True)
 
-        for item in crudedrug_items:
-            columns = item.get("columns") or {}
-            crudedrug_id = self._value_to_text(columns.get("ID")) or item.get("id")
-            crudedrug_name = self._value_to_text(columns.get("Crude drug name")) or columns.get("Crude drug name")
-
-            detail = item.get("detail")
-            if not detail:
-                detail_url = item.get("detail_url")
-                if detail_url:
-                    time.sleep(self.delay)
-                    detail = self._filter_detail_fields(
-                        "crudedrug",
-                        self._fetch_detail(detail_url, category="crudedrug"),
+        if entry_kind in {"assay", "identification"} and "id_range" in config:
+            jp_entries: List[Dict[str, object]] = []
+            collected = 0
+            lang_param = self.lang or "en"
+            id_range = config.get("id_range") or range(1, 51)
+            for raw_id in id_range:
+                if limit is not None and collected >= limit:
+                    break
+                identifier = str(raw_id)
+                if entry_kind == "assay":
+                    url = f"{BASE_URL}/mpdb-bin/view_jp_assay_data.cgi?id={identifier}&lang={lang_param}"
+                else:
+                    url = f"{BASE_URL}/mpdb-bin/view_jp_identification_data.cgi?id={identifier}&lang={lang_param}"
+                try:
+                    detail_fields, photos, memos = self._fetch_jp_entry(
+                        url,
+                        entry_kind=entry_kind,
+                        detail_data_type=config["detail_data_type"],
+                        category_key=config["category_key"],
+                        photo_data_type=config["photo_data_type"],
                     )
-                    if detail:
-                        item["detail"] = detail
-            if not detail:
-                continue
-
-            rows = detail.get("rows") if isinstance(detail, dict) else []
-            for row in rows:
-                if not isinstance(row, dict):
+                except requests.RequestException as exc:
+                    logging.warning("Skipping %s %s due to HTTP error: %s", config["prefix"], url, exc)
                     continue
-                label = normalise_text(row.get("label") or "")
-                if label.lower() != "jp data":
-                    continue
-                for link in row.get("links") or []:
-                    if not isinstance(link, dict):
-                        continue
-                    url = link.get("url")
-                    if not url or not self._is_jp_identification_link(url):
-                        continue
-                    identifier = self._extract_jp_identification_id(url)
-                    if not identifier:
-                        continue
-                    if limit and identifier not in jp_entries and len(jp_entries) >= limit:
-                        break
 
-                    entry = jp_entries.get(identifier)
-                    if entry:
-                        if crudedrug_id:
-                            entry["source_ids"].add(str(crudedrug_id))
-                        if crudedrug_name:
-                            entry["source_names"].add(str(crudedrug_name))
-                        continue
-
-                    try:
-                        detail_fields, photos, memos = self._fetch_jp_identification_entry(url)
-                    except requests.RequestException as exc:
-                        logging.warning("Skipping JP identification %s due to HTTP error: %s", url, exc)
-                        detail_fields, photos, memos = {}, [], []
-
+                if detail_fields or photos or memos:
                     for field in detail_fields.keys():
                         if field not in detail_field_order:
                             detail_field_order.append(field)
+                    jp_entries.append(
+                        {
+                            "jp_id": identifier,
+                            "link": url,
+                            "label": self._derive_jp_entry_label(entry_kind, detail_fields),
+                            "detail_fields": detail_fields,
+                            "photos": photos,
+                            "memos": memos,
+                        }
+                    )
+                    collected += 1
+            entries_list = jp_entries
+        else:
+            crudedrug_items: List[Dict] = []
+            if crudedrug_cache:
+                crudedrug_items = list(crudedrug_cache.get("items") or [])
 
-                    entry = {
-                        "jp_id": identifier,
-                        "link": url,
-                        "label": normalise_text(link.get("text") or ""),
-                        "source_ids": {str(crudedrug_id)} if crudedrug_id else set(),
-                        "source_names": {str(crudedrug_name)} if crudedrug_name else set(),
-                        "detail_fields": detail_fields,
-                        "photos": photos,
-                        "memos": memos,
-                    }
-                    jp_entries[identifier] = entry
+            if not crudedrug_items:
+                logging.info("Fetching crudedrug data to derive %s entries.", config["prefix"])
+                crudedrug_items, _ = self._crawl_category("crudedrug", include_details=True, limit=None)
 
-        sorted_entries = sorted(jp_entries.values(), key=lambda entry: entry["jp_id"])
+            jp_entries: Dict[str, Dict[str, object]] = {}
+            link_keyword = config["link_keyword"]
+
+            for item in crudedrug_items:
+                columns = item.get("columns") or {}
+                crudedrug_id = self._value_to_text(columns.get("ID")) or item.get("id")
+                crudedrug_name = self._value_to_text(columns.get("Crude drug name")) or columns.get("Crude drug name")
+
+                detail = item.get("detail")
+                if not detail:
+                    detail_url = item.get("detail_url")
+                    if detail_url:
+                        time.sleep(self.delay)
+                        detail = self._filter_detail_fields(
+                            "crudedrug",
+                            self._fetch_detail(detail_url, category="crudedrug"),
+                        )
+                        if detail:
+                            item["detail"] = detail
+                if not detail:
+                    continue
+
+                rows = detail.get("rows") if isinstance(detail, dict) else []
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    label = normalise_text(row.get("label") or "")
+                    if label.lower() != "jp data":
+                        continue
+                    for link in row.get("links") or []:
+                        if not isinstance(link, dict):
+                            continue
+                        url = link.get("url") or ""
+                        if link_keyword not in url.lower():
+                            continue
+                        identifier = self._extract_jp_entry_id(url)
+                        if not identifier:
+                            continue
+                        if limit and identifier not in jp_entries and len(jp_entries) >= limit:
+                            break
+
+                        entry = jp_entries.get(identifier)
+                        if entry:
+                            if include_sources:
+                                if crudedrug_id:
+                                    entry["source_ids"].add(str(crudedrug_id))
+                                if crudedrug_name:
+                                    entry["source_names"].add(str(crudedrug_name))
+                            continue
+
+                        try:
+                            detail_fields, photos, memos = self._fetch_jp_entry(
+                                url,
+                                entry_kind=entry_kind,
+                                detail_data_type=config["detail_data_type"],
+                                category_key=config["category_key"],
+                                photo_data_type=config["photo_data_type"],
+                            )
+                        except requests.RequestException as exc:
+                            logging.warning("Skipping %s %s due to HTTP error: %s", config["prefix"], url, exc)
+                            detail_fields, photos, memos = {}, [], []
+
+                        for field in detail_fields.keys():
+                            if field not in detail_field_order:
+                                detail_field_order.append(field)
+
+                        entry_data: Dict[str, object] = {
+                            "jp_id": identifier,
+                            "link": url,
+                            "label": normalise_text(link.get("text") or ""),
+                            "detail_fields": detail_fields,
+                            "photos": photos,
+                            "memos": memos,
+                        }
+                        if include_sources:
+                            entry_data["source_ids"] = {str(crudedrug_id)} if crudedrug_id else set()
+                            entry_data["source_names"] = {str(crudedrug_name)} if crudedrug_name else set()
+                        jp_entries[identifier] = entry_data
+
+            entries_list = list(jp_entries.values())
+
+        prefix = config["prefix"]
+        memo_header = f"{prefix} memo"
+        sorted_entries = sorted(entries_list, key=self._jp_entry_sort_key)
         headers = [
-            "JP identification ID",
-            "JP identification link",
-            "JP identification label",
-            "Source crudedrug IDs",
-            "Source crudedrug names",
-            "JP identification memo",
+            f"{prefix} ID",
+            f"{prefix} link",
+            f"{prefix} label",
         ]
+        if include_sources:
+            headers.extend(
+                [
+                    "Source crudedrug IDs",
+                    "Source crudedrug names",
+                ]
+            )
+        headers.append(memo_header)
         headers.extend(field for field in detail_field_order if field not in headers)
 
         items: List[Dict] = []
         include_photo_column = False
         for entry in sorted_entries:
             row_columns: Dict[str, object] = {
-                "JP identification ID": entry["jp_id"],
-                "JP identification link": entry["link"],
-                "JP identification label": entry["label"] or None,
-                "Source crudedrug IDs": "; ".join(sorted(entry["source_ids"])) if entry["source_ids"] else None,
-                "Source crudedrug names": "; ".join(sorted(entry["source_names"])) if entry["source_names"] else None,
+                f"{prefix} ID": entry["jp_id"],
+                f"{prefix} link": entry["link"],
+                f"{prefix} label": entry["label"] or None,
             }
+            if include_sources:
+                source_ids = entry.get("source_ids")
+                source_names = entry.get("source_names")
+                row_columns["Source crudedrug IDs"] = "; ".join(sorted(source_ids)) if source_ids else None
+                row_columns["Source crudedrug names"] = "; ".join(sorted(source_names)) if source_names else None
 
             memos = entry.get("memos") or []
-            if memos:
-                row_columns["JP identification memo"] = "; ".join(memos)
-            else:
-                row_columns["JP identification memo"] = None
+            row_columns[memo_header] = "; ".join(memos) if memos else None
 
             for field in detail_field_order:
                 row_columns[field] = entry["detail_fields"].get(field)
@@ -777,7 +917,7 @@ class MPDBCrawler:
             if self.download_photos and photos:
                 identifier = entry["jp_id"] or entry["link"]
                 if identifier:
-                    self._download_photos_for_category("jp_identification", identifier, photos)
+                    self._download_photos_for_category(config["category_key"], identifier, photos)
 
         if include_photo_column and "Detail photos" not in headers:
             headers.append("Detail photos")
@@ -828,9 +968,12 @@ class MPDBCrawler:
             value_text = normalise_text(value_cell.get_text(" ", strip=True))
             links = self._extract_links(value_cell)
             images = self._extract_images(value_cell)
+            growing_rows: List[Dict[str, object]] = []
             if images:
                 for image in images:
                     photo_entries.append({"source": "inline", **image})
+
+            is_growing_data_row = category == "plant" and label.lower() == "growing data"
 
             if label.lower() == "photo library" and links:
                 library_photos: List[Dict[str, object]] = []
@@ -844,6 +987,16 @@ class MPDBCrawler:
                 if library_photos:
                     for photo in library_photos:
                         photo_entries.append({"source": "library", **photo})
+            elif is_growing_data_row:
+                growing_rows = self._extract_growing_data_rows(value_cell)
+                if growing_rows:
+                    value_text = None
+                    if not links:
+                        links = None
+
+            if growing_rows:
+                rows.extend(growing_rows)
+                continue
 
             rows.append(
                 {
@@ -873,12 +1026,24 @@ class MPDBCrawler:
         return url if url else None
 
     @staticmethod
-    def _is_jp_identification_link(url: str) -> bool:
+    def _is_jp_entry_link(url: str, entry_kind: str) -> bool:
         normalized = (url or "").lower()
-        return "view_jp_assay_data.cgi" in normalized or "view_jp_identification_data.cgi" in normalized
+        if entry_kind == "assay":
+            return "view_jp_assay_data.cgi" in normalized
+        if entry_kind == "identification":
+            return "view_jp_identification_data.cgi" in normalized
+        return False
 
     @staticmethod
-    def _extract_jp_identification_id(url: str) -> Optional[str]:
+    def _is_jp_identification_link(url: str) -> bool:
+        return MPDBCrawler._is_jp_entry_link(url, "identification")
+
+    @staticmethod
+    def _is_jp_assay_link(url: str) -> bool:
+        return MPDBCrawler._is_jp_entry_link(url, "assay")
+
+    @staticmethod
+    def _extract_jp_entry_id(url: str) -> Optional[str]:
         parsed = urlparse(url)
         params = parse_qs(parsed.query)
         values = params.get("id")
@@ -888,6 +1053,52 @@ class MPDBCrawler:
         if path_segment:
             return path_segment
         return url if url else None
+
+    @staticmethod
+    def _extract_jp_identification_id(url: str) -> Optional[str]:
+        return MPDBCrawler._extract_jp_entry_id(url)
+
+    @staticmethod
+    def _derive_jp_entry_label(entry_kind: str, detail_fields: Dict[str, object]) -> Optional[str]:
+        if not isinstance(detail_fields, dict):
+            return None
+        preferred_keys: List[str] = []
+        if entry_kind == "assay":
+            preferred_keys.extend(
+                [
+                    "JP assay name",
+                    "Crude drug name",
+                    "Crude drug",
+                ]
+            )
+        elif entry_kind == "identification":
+            preferred_keys.extend(
+                [
+                    "JP identification name",
+                    "Crude drug name",
+                    "Crude drug",
+                ]
+            )
+        preferred_keys.extend(["Title", "Name"])
+        for key in preferred_keys:
+            value = detail_fields.get(key)
+            if isinstance(value, str):
+                value = value.strip()
+                if value:
+                    return value
+        for value in detail_fields.values():
+            if isinstance(value, str):
+                cleaned = value.strip()
+                if cleaned:
+                    return cleaned
+        return None
+
+    @staticmethod
+    def _jp_entry_sort_key(entry: Dict[str, object]) -> Tuple[int, object]:
+        identifier = entry.get("jp_id")
+        if isinstance(identifier, str) and identifier.isdigit():
+            return (0, int(identifier))
+        return (1, identifier or "")
 
     def _fetch_lcms_entry(self, url: str) -> Tuple[Dict[str, object], List[Dict[str, object]]]:
         html = self._fetch(url, "LCMSDetail", category="lcms")
@@ -1030,11 +1241,16 @@ class MPDBCrawler:
 
         return " | ".join(segment for segment in segments if segment)
 
-    def _fetch_jp_identification_entry(
+    def _fetch_jp_entry(
         self,
         url: str,
+        *,
+        entry_kind: str,
+        detail_data_type: str,
+        category_key: str,
+        photo_data_type: str,
     ) -> Tuple[Dict[str, object], List[Dict[str, object]], List[str]]:
-        html = self._fetch(url, "JPIdentificationDetail", category="jp_identification")
+        html = self._fetch(url, detail_data_type, category=category_key)
         soup = BeautifulSoup(html, "html.parser")
 
         table = soup.find("table", class_="detail")
@@ -1051,6 +1267,8 @@ class MPDBCrawler:
         memo_entries: List[str] = []
         last_photo: Optional[Dict[str, object]] = None
         row_counter = 1
+        prefix = "JP identification" if entry_kind == "identification" else "JP assay"
+        prefix_lower = prefix.lower()
 
         for tr in table.find_all("tr", recursive=False):
             cells = tr.find_all("td", recursive=False)
@@ -1070,68 +1288,87 @@ class MPDBCrawler:
             label_lower = label.lower()
             label_normalized = re.sub(r"\s+", " ", label_lower)
 
-            if "jp identification photo file" in label_normalized:
+            if f"{prefix_lower} photo file" in label_normalized:
                 last_photo = None
-                photo_links = self._extract_links(value_cell)
-                if photo_links:
-                    for link in photo_links:
-                        raw_url = link.get("url")
-                        if not raw_url:
-                            continue
-                        full_url, thumb_url, file_name = self._resolve_jp_identification_photo(raw_url)
-                        if not full_url and not thumb_url:
-                            continue
-                        if not file_name:
-                            file_name = normalise_text(link.get("text") or "") or self._filename_from_url(full_url or thumb_url)
-                        key_url = full_url or thumb_url or file_name
+                if entry_kind == "identification":
+                    extracted_photos = self._extract_jp_identification_photo_links(value_cell)
+                    for photo_entry in extracted_photos:
+                        key_url = (
+                            photo_entry.get("full_size_url")
+                            or photo_entry.get("thumbnail_url")
+                            or photo_entry.get("file_name")
+                        )
                         if key_url and key_url in photo_urls_seen:
                             continue
-                        photo_entry: Dict[str, object] = {
-                            "full_size_url": full_url,
-                            "thumbnail_url": thumb_url,
-                            "file_name": file_name,
-                        }
                         photos.append(photo_entry)
-                        last_photo = photo_entry if full_url or thumb_url else None
+                        last_photo = photo_entry
                         if key_url:
                             photo_urls_seen.add(key_url)
-                inline_images = self._extract_images(value_cell)
-                if inline_images:
-                    for image in inline_images:
-                        if not isinstance(image, dict):
-                            continue
-                        full_url = image.get("full_size_url") or image.get("thumbnail_url")
-                        if not full_url:
-                            continue
-                        if full_url in photo_urls_seen:
-                            last_photo = next((p for p in photos if p.get("full_size_url") == full_url or p.get("thumbnail_url") == full_url), None)
-                            continue
-                        thumb_url = image.get("thumbnail_url") if image.get("thumbnail_url") != full_url else None
-                        file_name = self._filename_from_url(full_url)
-                        photo_entry: Dict[str, object] = {
-                            "full_size_url": full_url,
-                            "thumbnail_url": thumb_url,
-                            "file_name": file_name,
-                        }
-                        alt_text = normalise_text(image.get("alt") or "")
-                        if alt_text:
-                            photo_entry["notes"] = [alt_text]
-                        photos.append(photo_entry)
-                        last_photo = photo_entry
-                        photo_urls_seen.add(full_url)
                 else:
-                    file_text = normalise_text(value_cell.get_text(" ", strip=True))
-                    if file_text:
-                        photo_entry = {
-                            "full_size_url": None,
-                            "thumbnail_url": None,
-                            "file_name": file_text,
-                        }
-                        photos.append(photo_entry)
-                        last_photo = photo_entry
+                    photo_links = self._extract_links(value_cell)
+                    if photo_links:
+                        for link in photo_links:
+                            raw_url = link.get("url")
+                            if not raw_url:
+                                continue
+                            full_url, thumb_url, file_name = self._resolve_jp_entry_photo(
+                                raw_url,
+                                category_key=category_key,
+                                photo_data_type=photo_data_type,
+                            )
+                            if not full_url and not thumb_url:
+                                continue
+                            if not file_name:
+                                file_name = normalise_text(link.get("text") or "") or self._filename_from_url(full_url or thumb_url)
+                            key_url = full_url or thumb_url or file_name
+                            if key_url and key_url in photo_urls_seen:
+                                continue
+                            photo_entry = {
+                                "full_size_url": full_url,
+                                "thumbnail_url": thumb_url,
+                                "file_name": file_name,
+                            }
+                            photos.append(photo_entry)
+                            last_photo = photo_entry if full_url or thumb_url else None
+                            if key_url:
+                                photo_urls_seen.add(key_url)
+                    inline_images = self._extract_images(value_cell)
+                    if inline_images:
+                        for image in inline_images:
+                            if not isinstance(image, dict):
+                                continue
+                            full_url = image.get("full_size_url") or image.get("thumbnail_url")
+                            if not full_url:
+                                continue
+                            if full_url in photo_urls_seen:
+                                last_photo = next((p for p in photos if p.get("full_size_url") == full_url or p.get("thumbnail_url") == full_url), None)
+                                continue
+                            thumb_url = image.get("thumbnail_url") if image.get("thumbnail_url") != full_url else None
+                            file_name = self._filename_from_url(full_url)
+                            photo_entry = {
+                                "full_size_url": full_url,
+                                "thumbnail_url": thumb_url,
+                                "file_name": file_name,
+                            }
+                            alt_text = normalise_text(image.get("alt") or "")
+                            if alt_text:
+                                photo_entry["notes"] = [alt_text]
+                            photos.append(photo_entry)
+                            last_photo = photo_entry
+                            photo_urls_seen.add(full_url)
+                    else:
+                        file_text = normalise_text(value_cell.get_text(" ", strip=True))
+                        if file_text:
+                            photo_entry = {
+                                "full_size_url": None,
+                                "thumbnail_url": None,
+                                "file_name": file_text,
+                            }
+                            photos.append(photo_entry)
+                            last_photo = photo_entry
                 continue
 
-            if "jp identification memo" in label_normalized:
+            if f"{prefix_lower} memo" in label_normalized:
                 memo_text = normalise_text(value_cell.get_text(" ", strip=True))
                 if memo_text:
                     target = last_photo or (photos[-1] if photos else None)
@@ -1197,9 +1434,33 @@ class MPDBCrawler:
             photos.append(photo_entry)
         return photos
 
-    def _resolve_jp_identification_photo(
+    def _extract_jp_identification_photo_links(self, cell) -> List[Dict[str, object]]:
+        photos: List[Dict[str, object]] = []
+        for anchor in cell.find_all("a", href=True):
+            href = anchor.get("href") or ""
+            match = _JP_IDENT_PHOTO_URL_PATTERN.search(href)
+            if not match:
+                continue
+            full_url = urljoin(BASE_URL, href)
+            photo_id = match.group(1)
+            file_name = f"{photo_id}.jpg"
+            img_tag = anchor.find("img")
+            thumb_url = urljoin(BASE_URL, img_tag["src"]) if img_tag and img_tag.get("src") else None
+            photos.append(
+                {
+                    "full_size_url": full_url,
+                    "thumbnail_url": thumb_url,
+                    "file_name": file_name,
+                }
+            )
+        return photos
+
+    def _resolve_jp_entry_photo(
         self,
         url: str,
+        *,
+        category_key: str,
+        photo_data_type: str,
     ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         if not url:
             return None, None, None
@@ -1214,7 +1475,7 @@ class MPDBCrawler:
         if any(resolved.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp")):
             return resolved, None, self._filename_from_url(resolved)
         try:
-            html = self._fetch(resolved, "JPIdentificationPhoto", category="jp_identification")
+            html = self._fetch(resolved, photo_data_type, category=category_key)
         except requests.RequestException:
             return None, None, None
         soup = BeautifulSoup(html, "html.parser")
@@ -1423,6 +1684,133 @@ class MPDBCrawler:
             )
         return images
 
+    @staticmethod
+    def _extract_growing_data_rows(value_cell) -> List[Dict[str, object]]:
+        """Extract structured rows from the plant Growing data table."""
+        field_order = [
+            "Class of Coldness",
+            "Class of Warmness",
+            "Light condition",
+            "Preference of Soil",
+            "Requirement of Shading",
+        ]
+        # Track additional labels that appear in the source but are not requested explicitly.
+        supplementary_labels = ["Class of Soil"]
+        label_map = {
+            "class of coldness": "Class of Coldness",
+            "class of warmness": "Class of Warmness",
+            "light condition": "Light condition",
+            "preference of soil": "Preference of Soil",
+            "requirement of shading": "Requirement of Shading",
+            "class of soil": "Class of Soil",
+        }
+
+        collected: Dict[str, Dict[str, object]] = {}
+
+        def _record(label: str, value: Optional[str], *, links=None, images=None) -> None:
+            normalized_value = normalise_text(value) if isinstance(value, str) else value
+            if isinstance(normalized_value, str) and not normalized_value:
+                normalized_value = None
+            existing = collected.get(label)
+            if not existing:
+                collected[label] = {
+                    "label": label,
+                    "value": normalized_value,
+                    "links": links or None,
+                    "images": images or None,
+                }
+                return
+
+            if normalized_value is not None:
+                current_value = existing.get("value")
+                if current_value:
+                    combined = f"{current_value} {normalized_value}".strip()
+                    existing["value"] = combined
+                else:
+                    existing["value"] = normalized_value
+
+            if links:
+                existing_links = list(existing.get("links") or [])
+                existing_links.extend(links)
+                existing["links"] = existing_links or None
+
+            if images:
+                existing_images = list(existing.get("images") or [])
+                existing_images.extend(images)
+                existing["images"] = existing_images or None
+
+        growing_table = value_cell.find("table")
+        if growing_table is not None:
+            for tr in growing_table.find_all("tr"):
+                cells = tr.find_all(["th", "td"])
+                if not cells:
+                    continue
+                index = 0
+                while index < len(cells):
+                    cell = cells[index]
+                    raw_text = normalise_text(cell.get_text(" ", strip=True))
+                    if not raw_text:
+                        index += 1
+                        continue
+                    normalized_label = raw_text.rstrip(":：").strip().lower()
+                    canonical = label_map.get(normalized_label)
+                    if not canonical:
+                        lower_text = raw_text.lower()
+                        handled = False
+                        for key, mapped in label_map.items():
+                            if lower_text.startswith(key):
+                                remainder = normalise_text(raw_text[len(key) :].lstrip(":： "))
+                                _record(mapped, remainder or None)
+                                handled = True
+                                break
+                        if handled:
+                            index += 1
+                            continue
+                        index += 1
+                        continue
+
+                    value_node = cells[index + 1] if index + 1 < len(cells) else None
+                    if value_node is not None:
+                        value_text = normalise_text(value_node.get_text(" ", strip=True))
+                        links = MPDBCrawler._extract_links(value_node)
+                        images = MPDBCrawler._extract_images(value_node)
+                        _record(canonical, value_text or None, links=links, images=images)
+                        index += 2
+                        continue
+
+                    label_without_suffix = raw_text.rstrip(":：")
+                    offset = len(label_without_suffix)
+                    remainder = normalise_text(raw_text[offset:].lstrip(":： "))
+                    _record(canonical, remainder or None)
+                    index += 1
+
+        collapsed_text = normalise_text(value_cell.get_text(" ", strip=True))
+        if collapsed_text:
+            label_pattern = re.compile(
+                r"(Class of Coldness|Class of Warmness|Light Condition|Preference of Soil|Requirement of Shading|Class of Soil)\s*[:：]?\s*",
+                re.IGNORECASE,
+            )
+            matches = list(label_pattern.finditer(collapsed_text))
+            if matches:
+                for idx, match in enumerate(matches):
+                    canonical = label_map.get(normalise_text(match.group(1)).lower())
+                    if not canonical:
+                        continue
+                    start = match.end()
+                    end = matches[idx + 1].start() if idx + 1 < len(matches) else len(collapsed_text)
+                    value_text = normalise_text(collapsed_text[start:end])
+                    existing = collected.get(canonical)
+                    if existing and existing.get("value") is not None:
+                        continue
+                    _record(canonical, value_text or None)
+
+        ordered_labels = [label for label in field_order if label in collected]
+        for supplementary in supplementary_labels:
+            if supplementary in collected and supplementary not in ordered_labels:
+                ordered_labels.append(supplementary)
+
+        return [collected[label] for label in ordered_labels]
+
     def _fetch_photo_library(self, photo_page_url: str, category: Optional[str] = None) -> List[Dict[str, object]]:
         """Fetch photo library entries from the dedicated plant photo page."""
         html = self._fetch(photo_page_url, 'PhotoLibrary', category=category)
@@ -1583,15 +1971,18 @@ class MPDBCrawler:
             "compound": "compounds",
             "lcms": "lcms",
             "jp_identification": "jp_identification",
+            "jp_assay": "jp_assay",
         }.get(category, category)
         target_dir = self.photo_root / category_dir / self._safe_segment(identifier)
         target_dir.mkdir(parents=True, exist_ok=True)
 
         for index, photo in enumerate(photos, start=1):
-            url = photo.get("full_size_url") or photo.get("thumbnail_url")
-            if not url:
+            primary_url = photo.get("full_size_url")
+            fallback_url = photo.get("thumbnail_url")
+            if not primary_url and not fallback_url:
                 continue
 
+            url = primary_url or fallback_url
             filename = photo.get("file_name")
             if not filename:
                 parsed = urlparse(url)
@@ -1607,9 +1998,13 @@ class MPDBCrawler:
                 continue
 
             time.sleep(self.delay)
-            self._download_file(url, destination, category=category)
+            succeeded = self._download_file(url, destination, category=category)
+            if not succeeded and primary_url and fallback_url and fallback_url != primary_url:
+                logging.debug("Retrying photo download with fallback URL for %s", destination)
+                time.sleep(self.delay)
+                self._download_file(fallback_url, destination, category=category)
 
-    def _download_file(self, url: str, destination: Path, category: Optional[str] = None) -> None:
+    def _download_file(self, url: str, destination: Path, category: Optional[str] = None) -> bool:
         """Download binary content to a destination path."""
         try:
             response = self.session.get(url, timeout=self.timeout)
@@ -1617,16 +2012,22 @@ class MPDBCrawler:
         except requests.Timeout as exc:
             self._log_http_error("timeout_download", url, exc, {"destination": str(destination)}, category=category)
             logging.warning("Failed to download %s: %s", url, exc)
-            return
+            return False
         except requests.RequestException as exc:
             self._log_http_error("http_error_download", url, exc, {"destination": str(destination)}, category=category)
             logging.warning("Failed to download %s: %s", url, exc)
-            return
+            return False
 
         destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("wb") as handle:
-            handle.write(response.content)
+        try:
+            with destination.open("wb") as handle:
+                handle.write(response.content)
+        except OSError as exc:
+            logging.warning("Failed to write downloaded photo %s: %s", destination, exc)
+            return False
+
         logging.info("Downloaded photo -> %s", destination)
+        return True
 
     def _log_http_error(
         self,
