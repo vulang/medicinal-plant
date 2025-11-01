@@ -24,13 +24,15 @@ from urllib.parse import parse_qs, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from plant_crawler import crawl_plant
+from plant_crawler import crawl_cultivation, crawl_plant, crawl_tissue_culture_literature
 
 
 BASE_URL = "http://mpdb.nibiohn.go.jp"
 LIST_ENDPOINT = "/mpdb-bin/list_data.cgi"
 SUPPORTED_CATEGORIES = {
     "plant": "Plant data list (reference crawler)",
+    "tissue_culture_literature": "Tissue culture literature list",
+    "cultivation": "Cultivation data list",
     "crudedrug": "Crude drug data list",
     "jplist": "JP crude drug list",
     "syohou": "Kampo formula data list",
@@ -137,6 +139,7 @@ class MPDBCrawler:
                 "Accept-Charset": DEFAULT_HTML_ENCODING,
             }
         )
+        self._additional_results: Dict[str, CrawlResult] = {}
 
     def crawl(
         self,
@@ -144,6 +147,7 @@ class MPDBCrawler:
         include_details: bool = False,
         limit: Optional[int] = None,
     ) -> List[CrawlResult]:
+        self._additional_results = {}
         results: List[CrawlResult] = []
         category_cache: Dict[str, Dict[str, object]] = {}
         for category in categories:
@@ -151,6 +155,50 @@ class MPDBCrawler:
             try:
                 if category == "plant":
                     items, headers = crawl_plant(self, include_details=include_details, limit=limit)
+                    category_cache[category] = {
+                        "items": items,
+                        "headers": headers,
+                        "include_details": include_details,
+                        "limit": limit,
+                    }
+                elif category == "tissue_culture_literature":
+                    extra_result = self._additional_results.get(category)
+                    if extra_result:
+                        items, headers = extra_result.items, extra_result.columns
+                    else:
+                        items, headers = crawl_tissue_culture_literature(
+                            self, include_details=include_details, limit=limit
+                        )
+                        if items:
+                            self.register_additional_result(
+                                category=category,
+                                items=items,
+                                headers=headers,
+                            )
+                            extra_result = self._additional_results.get(category)
+                            if extra_result:
+                                items, headers = extra_result.items, extra_result.columns
+                    category_cache[category] = {
+                        "items": items,
+                        "headers": headers,
+                        "include_details": include_details,
+                        "limit": limit,
+                    }
+                elif category == "cultivation":
+                    extra_result = self._additional_results.get(category)
+                    if extra_result:
+                        items, headers = extra_result.items, extra_result.columns
+                    else:
+                        items, headers = crawl_cultivation(self, include_details=include_details, limit=limit)
+                        if items:
+                            self.register_additional_result(
+                                category=category,
+                                items=items,
+                                headers=headers,
+                            )
+                            extra_result = self._additional_results.get(category)
+                            if extra_result:
+                                items, headers = extra_result.items, extra_result.columns
                     category_cache[category] = {
                         "items": items,
                         "headers": headers,
@@ -185,6 +233,41 @@ class MPDBCrawler:
                 continue
             results.append(CrawlResult(category=category, columns=headers, items=items))
         return results
+
+    def register_additional_result(
+        self,
+        *,
+        category: str,
+        items: List[Dict],
+        headers: List[str],
+    ) -> None:
+        """Register an auxiliary dataset produced while crawling a category."""
+        if not category or not items:
+            return
+        deduped_headers: List[str] = []
+        seen_headers: Set[str] = set()
+        for column in headers:
+            if column not in seen_headers:
+                deduped_headers.append(column)
+                seen_headers.add(column)
+
+        existing = self._additional_results.get(category)
+        if existing:
+            for column in deduped_headers:
+                if column not in existing.columns:
+                    existing.columns.append(column)
+            existing.items.extend(items)
+            return
+
+        self._additional_results[category] = CrawlResult(
+            category=category,
+            columns=deduped_headers,
+            items=list(items),
+        )
+
+    def get_additional_results(self) -> List[CrawlResult]:
+        """Return additional datasets collected during the most recent crawl."""
+        return list(self._additional_results.values())
 
     def _fetch(self, url: str, dataType: str, params: Optional[Dict] = None, category: Optional[str] = None) -> str:
         """Fetch raw HTML, raising for HTTP errors."""
@@ -1972,6 +2055,7 @@ class MPDBCrawler:
             "lcms": "lcms",
             "jp_identification": "jp_identification",
             "jp_assay": "jp_assay",
+            "cultivation": "cultivation",
         }.get(category, category)
         target_dir = self.photo_root / category_dir / self._safe_segment(identifier)
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -2350,10 +2434,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         logging.error("Unexpected error: %s", exc, exc_info=args.verbose)
         return 1
 
+    additional_results = crawler.get_additional_results()
+
     if args.format == "json":
         serialisable = [
             {"category": result.category, "items": result.items} for result in results
         ]
+        if additional_results:
+            serialisable.extend({"category": result.category, "items": result.items} for result in additional_results)
         payload = json.dumps(serialisable, ensure_ascii=False, indent=2)
 
         if args.output:
@@ -2368,7 +2456,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # CSV output path handling
     if args.format == "csv":
-        if not args.output and len(results) > 1:
+        if not args.output and (len(results) + len(additional_results)) > 1:
             logging.error("CSV output requires --output when multiple categories are requested.")
             return 1
 
@@ -2376,6 +2464,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             if hasattr(sys.stdout, "reconfigure"):
                 sys.stdout.reconfigure(encoding="utf-8", newline="")
             write_csv_result(results[0], sys.stdout)
+            if additional_results:
+                logging.warning(
+                    "Additional datasets (%s) not written when streaming CSV to stdout. "
+                    "Provide --output to persist them.",
+                    ", ".join(result.category for result in additional_results),
+                )
             return 0
 
         output_path = args.output
@@ -2390,6 +2484,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             with file_path.open("w", encoding=CSV_FILE_ENCODING, newline="") as handle:
                 write_csv_result(result, handle)
             logging.info("Wrote category '%s' to %s", result.category, file_path)
+            if additional_results:
+                target_dir = file_path.parent if file_path.suffix else output_path
+                target_dir.mkdir(parents=True, exist_ok=True)
+                for extra in additional_results:
+                    extra_path = target_dir / f"{extra.category}.csv"
+                    with extra_path.open("w", encoding=CSV_FILE_ENCODING, newline="") as handle:
+                        write_csv_result(extra, handle)
+                    logging.info("Wrote additional dataset '%s' to %s", extra.category, extra_path)
             return 0
 
         # multiple categories
@@ -2402,6 +2504,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             with file_path.open("w", encoding=CSV_FILE_ENCODING, newline="") as handle:
                 write_csv_result(result, handle)
             logging.info("Wrote category '%s' to %s", result.category, file_path)
+        if additional_results:
+            for extra in additional_results:
+                extra_path = output_path / f"{extra.category}.csv"
+                with extra_path.open("w", encoding=CSV_FILE_ENCODING, newline="") as handle:
+                    write_csv_result(extra, handle)
+                logging.info("Wrote additional dataset '%s' to %s", extra.category, extra_path)
         return 0
 
     return 0
