@@ -1,9 +1,22 @@
 import os
 from typing import Tuple
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+from torchvision.datasets.folder import IMG_EXTENSIONS
+
+
+def _is_valid_image(path: str) -> bool:
+    if not path.lower().endswith(IMG_EXTENSIONS):
+        return False
+    try:
+        with Image.open(path) as img:
+            img.verify()
+        return True
+    except (UnidentifiedImageError, OSError):
+        print(f"[WARN] Skipping unreadable image: {path}")
+        return False
 
 def build_transforms(img_size: int = 224, is_train: bool = True):
     if is_train:
@@ -22,8 +35,19 @@ def build_transforms(img_size: int = 224, is_train: bool = True):
     return tfm
 
 def build_dataloaders(train_dir: str, val_dir: str, img_size: int, batch_size: int, num_workers: int):
-    train_ds = datasets.ImageFolder(train_dir, transform=build_transforms(img_size, is_train=True))
-    val_ds = datasets.ImageFolder(val_dir, transform=build_transforms(img_size, is_train=False))
+    # Some classes currently have empty folders; allow_empty avoids hard failures while keeping class ordering consistent.
+    train_ds = datasets.ImageFolder(
+        train_dir,
+        transform=build_transforms(img_size, is_train=True),
+        is_valid_file=_is_valid_image,
+        allow_empty=True
+    )
+    val_ds = datasets.ImageFolder(
+        val_dir,
+        transform=build_transforms(img_size, is_train=False),
+        is_valid_file=_is_valid_image,
+        allow_empty=True
+    )
 
     class_names = train_ds.classes
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers)
@@ -31,7 +55,12 @@ def build_dataloaders(train_dir: str, val_dir: str, img_size: int, batch_size: i
     return train_loader, val_loader, class_names
 
 def build_testloader(test_dir: str, img_size: int, batch_size: int, num_workers: int, class_names):
-    test_ds = datasets.ImageFolder(test_dir, transform=build_transforms(img_size, is_train=False))
+    test_ds = datasets.ImageFolder(
+        test_dir,
+        transform=build_transforms(img_size, is_train=False),
+        is_valid_file=_is_valid_image,
+        allow_empty=True
+    )
     # Ensure class order matches training
     assert test_ds.classes == class_names, "Test classes differ from training classes."
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
