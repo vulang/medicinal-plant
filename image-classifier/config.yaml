@@ -9,13 +9,13 @@ img_size: 224
 batch_size: 32
 num_workers: 2
 
-model_name: resnet18   # choices: resnet18, resnet50, efficientnet_b0, mobilenet_v3_small
+model_name: resnet50   # choices: resnet18, resnet50, efficientnet_b0, mobilenet_v3_small
 pretrained: true
 
-epochs: 10
+epochs: 50
 learning_rate: 0.0005
 weight_decay: 0.0001
 
-device: auto           # auto | cpu | cuda | mps
+device: cuda           # auto | cpu | cuda | mps
 save_dir: models
 outputs_dir: outputs

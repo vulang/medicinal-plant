@@ -35,7 +35,7 @@ medicinal-plant-image-classifier/
 
 ## 🚀 Quickstart
 
-1) **Create your dataset** in this layout:
+1) **Create your dataset** in this layout (or auto-populate it with the copy script below):
 ```
 data/
   train/
@@ -49,6 +49,12 @@ data/
   test/
     ...
 ```
+
+> To copy photos from `crawler/photos/plants/` and split them automatically, run:
+> ```
+> python3 copy_and_split_data.py --clear
+> ```
+> Use `--val-ratio`/`--test-ratio` to adjust split sizes and `--source`/`--destination` if your paths differ from the defaults.
 
 2) **Create a virtual environment**
 ```

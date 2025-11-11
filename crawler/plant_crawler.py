@@ -731,11 +731,29 @@ def crawl_plant(
             mapped_columns[column] = value if value is not None else ""
 
         identifier = mapped_columns.get("ID")
+        photo_identifier = None
+        if hasattr(crawler, "_derive_photo_identifier"):
+            try:
+                photo_identifier = crawler._derive_photo_identifier("plant", entry, None)
+            except Exception:  # pragma: no cover - defensive against future refactors
+                photo_identifier = None
+        if not photo_identifier:
+            photo_identifier = identifier or entry.get("Plant latin name") or entry.get("Common name")
+
         payload: Dict[str, Any] = {"columns": mapped_columns}
         if identifier:
             payload["id"] = identifier
 
         transformed.append(payload)
+
+        if getattr(crawler, "download_photos", False) and hasattr(crawler, "download_inaturalist_photos"):
+            plant_names: List[str] = []
+            for key in ("Plant latin name", "Common name", "Crude drug latin name"):
+                name_value = entry.get(key)
+                if name_value:
+                    plant_names.append(name_value)
+            if plant_names and photo_identifier:
+                crawler.download_inaturalist_photos(photo_identifier, plant_names)
 
     if tissue_entries:
         tissue_items, tissue_headers = _build_tissue_dataset(tissue_entries)

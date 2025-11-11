@@ -45,6 +45,13 @@ SUPPORTED_CATEGORIES = {
     "gene": "Gene data list",
 }
 
+INAT_API_BASE = "https://api.inaturalist.org/v1"
+INAT_OBSERVATIONS_ENDPOINT = f"{INAT_API_BASE}/observations"
+INAT_TAXA_ENDPOINT = f"{INAT_API_BASE}/taxa"
+INAT_DEFAULT_MAX_PHOTOS = 1000
+INAT_DEFAULT_REQUEST_DELAY = 1.0
+INAT_DEFAULT_CACHE_TTL = 3600.0
+
 CSV_FILE_ENCODING = "utf-8"
 DEFAULT_HTML_ENCODING = "utf-8"
 HTTP_ERROR_LOG_TEMPLATE = "crawler_http_errors_{category}.log"
@@ -125,12 +132,20 @@ class MPDBCrawler:
         timeout: float = 30.0,
         download_photos: bool = False,
         photo_root: Optional[Path] = None,
+        inat_max_photos: int = INAT_DEFAULT_MAX_PHOTOS,
+        inat_request_delay: float = INAT_DEFAULT_REQUEST_DELAY,
+        inat_cache_ttl: float = INAT_DEFAULT_CACHE_TTL,
+        inat_only_photos: bool = False,
     ):
         self.lang = lang
         self.delay = delay
         self.timeout = timeout
         self.download_photos = download_photos
         self.photo_root = Path(photo_root) if photo_root else Path("photos")
+        self.inat_max_photos = max(0, int(inat_max_photos))
+        self.inat_request_delay = max(0.0, float(inat_request_delay))
+        self.inat_cache_ttl = max(0.0, float(inat_cache_ttl))
+        self.inat_only_photos = inat_only_photos
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -140,6 +155,10 @@ class MPDBCrawler:
             }
         )
         self._additional_results: Dict[str, CrawlResult] = {}
+        self._inat_photo_cache: Dict[str, Tuple[float, List[Dict[str, object]]]] = {}
+        self._inat_taxon_cache: Dict[str, Tuple[float, Optional[int]]] = {}
+        self._inat_last_request: float = 0.0
+        self._inat_completed_identifiers: Set[str] = set()
 
     def crawl(
         self,
@@ -1969,8 +1988,11 @@ class MPDBCrawler:
     ) -> Optional[str]:
         """Determine a filesystem-safe identifier for photo downloads."""
         if category == "plant":
+            plant_id = self._value_to_text(row_data.get("ID"))
+            if plant_id:
+                return plant_id
             name = self._extract_plant_name(row_data)
-            return name or self._value_to_text(row_data.get("ID"))
+            return name or plant_id
 
         if category == "sample":
             serial_candidates = [
@@ -2046,8 +2068,355 @@ class MPDBCrawler:
         cleaned = re.sub(r"[\s]+", "_", cleaned)
         return cleaned or fallback
 
-    def _download_photos_for_category(self, category: str, identifier: str, photos: List[Dict[str, object]]) -> None:
+    @staticmethod
+    def _photo_already_present(target_dir: Path, safe_name: str) -> Optional[Path]:
+        """Return existing path when a photo (name/stem) is already stored."""
+        candidate = target_dir / safe_name
+        if candidate.exists():
+            return candidate
+        stem = Path(safe_name).stem
+        if not stem:
+            return None
+        pattern = f"{stem}.*"
+        for existing in target_dir.glob(pattern):
+            if existing.is_file():
+                return existing
+        return None
+
+    def download_inaturalist_photos(self, identifier: Optional[str], names: Iterable[str]) -> None:
+        """Enrich plant photo sets with iNaturalist imagery."""
+        if not self.download_photos or self.inat_max_photos <= 0:
+            return
+        if not identifier:
+            return
+        candidate_names = self._inat_prepare_candidate_names(names)
+        if not candidate_names:
+            return
+        if identifier in self._inat_completed_identifiers:
+            logging.debug("iNaturalist photos already attempted for %s", identifier)
+            return
+        logging.info("Requesting iNaturalist photos for %s (%s)", identifier, ", ".join(candidate_names))
+        try:
+            photos = self._fetch_inaturalist_photos(candidate_names)
+        except Exception as exc:  # pragma: no cover - defensive guardrail
+            logging.warning("iNaturalist lookup failed for %s: %s", identifier, exc)
+            self._inat_completed_identifiers.add(identifier)
+            return
+
+        self._inat_completed_identifiers.add(identifier)
+        if not photos:
+            logging.info("iNaturalist returned no photos for %s", identifier)
+            return
+        logging.info("Downloading %d iNaturalist photos for %s", len(photos), identifier)
+        self._download_photos_for_category("plant", identifier, photos, source="inat")
+
+    def _fetch_inaturalist_photos(self, candidate_names: Iterable[str]) -> List[Dict[str, object]]:
+        variants = self._inat_generate_name_variants(candidate_names)
+        if not variants or self.inat_max_photos <= 0:
+            return []
+
+        collected: List[Dict[str, object]] = []
+        seen_pairs: Set[Tuple[Optional[int], Optional[int]]] = set()
+
+        def _append_new(entries: List[Dict[str, object]]) -> None:
+            for entry in entries:
+                key = (entry.get("observation_id"), entry.get("photo_id"))
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+                collected.append(entry)
+                if len(collected) >= self.inat_max_photos:
+                    break
+
+        for variant in variants:
+            photos = self._inat_fetch_for_query("taxon_name", variant)
+            if photos:
+                _append_new(photos)
+            if len(collected) >= self.inat_max_photos:
+                return collected[: self.inat_max_photos]
+
+        if len(collected) >= self.inat_max_photos:
+            return collected[: self.inat_max_photos]
+
+        seen_taxon_ids: Set[int] = set()
+        for variant in variants:
+            taxon_id = self._inat_lookup_taxon_id(variant)
+            if not taxon_id or taxon_id in seen_taxon_ids:
+                continue
+            seen_taxon_ids.add(taxon_id)
+            photos = self._inat_fetch_for_query("taxon_id", str(taxon_id))
+            if photos:
+                _append_new(photos)
+            if len(collected) >= self.inat_max_photos:
+                break
+
+        return collected[: self.inat_max_photos]
+
+    def _inat_prepare_candidate_names(self, names: Iterable[str]) -> List[str]:
+        tokens: List[str] = []
+        seen: Set[str] = set()
+        for raw in names:
+            if not raw:
+                continue
+            for fragment in re.split(r"[,;/|]+", str(raw)):
+                normalized = normalise_text(fragment)
+                if not normalized:
+                    continue
+                lowered = normalized.lower()
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                tokens.append(normalized)
+        return tokens
+
+    def _inat_generate_name_variants(self, candidate_names: Iterable[str]) -> List[str]:
+        variants: List[str] = []
+        seen: Set[str] = set()
+        for name in candidate_names:
+            for variant in self._inat_variant_from_name(name):
+                lowered = variant.lower()
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                variants.append(variant)
+        return variants
+
+    def _inat_variant_from_name(self, name: str) -> List[str]:
+        base = normalise_text(name)
+        if not base:
+            return []
+
+        variants: List[str] = [base]
+        stripped = re.sub(r"\([^)]*\)", "", base).strip()
+        if stripped and stripped != base:
+            variants.append(stripped)
+
+        without_authors = re.split(r"\b(?:var\.|subsp\.|ssp\.|f\.)\b", stripped, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        if without_authors and without_authors not in variants:
+            variants.append(without_authors)
+
+        token_list = without_authors.split()
+        if len(token_list) >= 2:
+            binomial = " ".join(token_list[:2])
+            if binomial and binomial not in variants:
+                variants.append(binomial)
+        if token_list:
+            genus = token_list[0]
+            if genus and genus not in variants:
+                variants.append(genus)
+        return variants
+
+    def _inat_lookup_taxon_id(self, name: str) -> Optional[int]:
+        cache_key = f"taxon:{name.lower()}"
+        found, cached = self._inat_get_cached_payload(self._inat_taxon_cache, cache_key)
+        if found:
+            logging.info("iNaturalist taxon cache hit for '%s' -> %s", name, cached)
+            return cached
+
+        params = {
+            "q": name,
+            "per_page": 1,
+            "order": "desc",
+            "order_by": "score",
+        }
+        self._inat_sleep_if_needed()
+        logging.info("iNaturalist taxon lookup q=%s", name)
+        try:
+            response = self.session.get(INAT_TAXA_ENDPOINT, params=params, timeout=self.timeout)
+            response.raise_for_status()
+            payload = response.json()
+        except requests.Timeout as exc:
+            logging.warning("iNaturalist taxon lookup timeout for '%s': %s", name, exc)
+            self._inat_store_cache_payload(self._inat_taxon_cache, cache_key, None)
+            return None
+        except (requests.RequestException, ValueError) as exc:
+            logging.warning("iNaturalist taxon lookup failed for '%s': %s", name, exc)
+            self._inat_store_cache_payload(self._inat_taxon_cache, cache_key, None)
+            return None
+        finally:
+            self._inat_last_request = time.monotonic()
+
+        results = payload.get("results") or []
+        taxon_id = None
+        if results:
+            candidate = results[0]
+            taxon_id = candidate.get("id")
+        self._inat_store_cache_payload(self._inat_taxon_cache, cache_key, taxon_id)
+        logging.info("iNaturalist taxon lookup q=%s -> %s", name, taxon_id)
+        return taxon_id
+
+    def _inat_fetch_for_query(self, query_type: str, value: str) -> List[Dict[str, object]]:
+        cache_key = f"{query_type}:{value}".lower()
+        found, cached = self._inat_get_cached_payload(self._inat_photo_cache, cache_key)
+        if found:
+            cached_photos: List[Dict[str, object]] = list(cached or [])
+            logging.info("iNaturalist cache hit for %s (%d photos)", cache_key, len(cached_photos))
+            return [dict(entry) for entry in cached_photos]
+
+        params = {
+            "order": "desc",
+            "order_by": "votes",
+            "photos": "true",
+            "per_page": min(200, max(30, self.inat_max_photos * 2)),
+        }
+        if query_type == "taxon_name":
+            params["taxon_name"] = value
+        else:
+            params["taxon_id"] = value
+
+        log_hint = f"{query_type}={value}"
+        photos = self._inat_request_observations(params, log_hint)
+        self._inat_store_cache_payload(self._inat_photo_cache, cache_key, [dict(entry) for entry in photos])
+        return photos
+
+    def _inat_request_observations(self, params: Dict[str, object], log_hint: str) -> List[Dict[str, object]]:
+        self._inat_sleep_if_needed()
+        logging.info("iNaturalist lookup %s", log_hint)
+        try:
+            response = self.session.get(INAT_OBSERVATIONS_ENDPOINT, params=params, timeout=self.timeout)
+            response.raise_for_status()
+            payload = response.json()
+        except requests.Timeout as exc:
+            logging.warning("iNaturalist lookup timeout for %s: %s", log_hint, exc)
+            return []
+        except (requests.RequestException, ValueError) as exc:
+            logging.warning("iNaturalist lookup failed for %s: %s", log_hint, exc)
+            return []
+        finally:
+            self._inat_last_request = time.monotonic()
+
+        results = payload.get("results") or []
+        normalized: List[Dict[str, object]] = []
+        for observation in results:
+            obs_id = observation.get("id")
+            observation_url = observation.get("uri") or (f"https://www.inaturalist.org/observations/{obs_id}" if obs_id else None)
+            for photo in observation.get("photos") or []:
+                normalized_photo = self._inat_normalize_photo(photo, obs_id, observation_url)
+                if normalized_photo:
+                    normalized.append(normalized_photo)
+                if len(normalized) >= self.inat_max_photos:
+                    break
+            if len(normalized) >= self.inat_max_photos:
+                break
+
+        logging.info("iNaturalist response for %s returned %d photos", log_hint, len(normalized))
+        return normalized
+
+    @staticmethod
+    def _inat_normalize_photo(
+        photo: Dict[str, object],
+        observation_id: Optional[int],
+        observation_url: Optional[str],
+    ) -> Optional[Dict[str, object]]:
+        photo_id = photo.get("id")
+        if not photo_id:
+            return None
+
+        full_url = MPDBCrawler._inat_pick_photo_url(
+            photo,
+            preferred_sizes=("medium", "large", "original", "small", "square", "thumb"),
+        )
+        thumb_url = MPDBCrawler._inat_pick_photo_url(
+            photo,
+            preferred_sizes=("small", "thumb", "square", "medium"),
+            fallback=full_url,
+        )
+        if not full_url and not thumb_url:
+            return None
+
+        path = urlparse(full_url or thumb_url).path
+        extension = Path(path).suffix or ".jpg"
+        filename = f"inat_obs{observation_id or 'unknown'}_photo{photo_id}{extension}"
+
+        normalized: Dict[str, object] = {
+            "full_size_url": full_url or thumb_url,
+            "thumbnail_url": thumb_url or full_url,
+            "file_name": filename,
+            "source": "iNaturalist",
+            "photo_id": photo_id,
+            "observation_id": observation_id,
+            "observation_url": observation_url,
+            "attribution": photo.get("attribution"),
+            "license": photo.get("license_code"),
+        }
+        return normalized
+
+    @staticmethod
+    def _inat_pick_photo_url(
+        photo: Dict[str, object],
+        *,
+        preferred_sizes: Iterable[str],
+        fallback: Optional[str] = None,
+    ) -> Optional[str]:
+        size_keys = list(preferred_sizes)
+        for size in size_keys:
+            direct = photo.get(f"{size}_url") or photo.get(f"{size}Url")
+            if isinstance(direct, str) and direct:
+                return direct
+            scaled = MPDBCrawler._inat_scale_photo_url(photo.get("url"), size)
+            if scaled:
+                return scaled
+        return fallback or photo.get("url")
+
+    @staticmethod
+    def _inat_scale_photo_url(url: Optional[str], size: str) -> Optional[str]:
+        if not url:
+            return None
+        pattern = r"/(square|small|medium|large|original|thumb)(\.\w+)"
+        if not re.search(pattern, url):
+            return None
+        return re.sub(pattern, fr"/{size}\2", url, count=1)
+
+    def _inat_get_cached_payload(
+        self,
+        cache: Dict[str, Tuple[float, object]],
+        key: str,
+    ) -> Tuple[bool, Optional[object]]:
+        if self.inat_cache_ttl <= 0:
+            return False, None
+        entry = cache.get(key)
+        if not entry:
+            return False, None
+        timestamp, payload = entry
+        if (time.monotonic() - timestamp) > self.inat_cache_ttl:
+            cache.pop(key, None)
+            return False, None
+        return True, payload
+
+    def _inat_store_cache_payload(
+        self,
+        cache: Dict[str, Tuple[float, object]],
+        key: str,
+        payload: Optional[object],
+    ) -> None:
+        if self.inat_cache_ttl <= 0:
+            return
+        cache[key] = (time.monotonic(), payload)
+
+    def _inat_sleep_if_needed(self) -> None:
+        minimum_delay = max(self.delay, self.inat_request_delay)
+        if minimum_delay <= 0 or self._inat_last_request <= 0:
+            return
+        elapsed = time.monotonic() - self._inat_last_request
+        if elapsed < minimum_delay:
+            time.sleep(minimum_delay - elapsed)
+
+    def _download_photos_for_category(
+        self,
+        category: str,
+        identifier: str,
+        photos: List[Dict[str, object]],
+        *,
+        source: str = "mpdb",
+    ) -> None:
         """Download photos into the configured directory for a specific category."""
+        if self.inat_only_photos and source != "inat":
+            logging.debug(
+                "Skipping MPDB photo download for %s/%s due to --inat-only-photos",
+                category,
+                identifier,
+            )
+            return
         category_dir = {
             "plant": "plants",
             "sample": "samples",
@@ -2077,8 +2446,9 @@ class MPDBCrawler:
             safe_name = self._safe_segment(filename, fallback=f"photo_{index}.jpg")
             destination = target_dir / safe_name
 
-            if destination.exists():
-                logging.debug("Photo already exists, skipping: %s", destination)
+            existing = self._photo_already_present(target_dir, safe_name)
+            if existing:
+                logging.info("Photo already exists, skipping download: %s", existing)
                 continue
 
             time.sleep(self.delay)
@@ -2383,6 +2753,29 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Root output directory for downloaded photos (default: ./photos).",
     )
     parser.add_argument(
+        "--inat-max-photos",
+        type=int,
+        default=INAT_DEFAULT_MAX_PHOTOS,
+        help="Maximum number of iNaturalist photos to download per plant (default: 24).",
+    )
+    parser.add_argument(
+        "--inat-request-delay",
+        type=float,
+        default=INAT_DEFAULT_REQUEST_DELAY,
+        help="Minimum seconds between iNaturalist API calls (default: 1.0).",
+    )
+    parser.add_argument(
+        "--inat-cache-ttl",
+        type=float,
+        default=INAT_DEFAULT_CACHE_TTL,
+        help="Seconds to reuse cached iNaturalist responses before refreshing (default: 3600).",
+    )
+    parser.add_argument(
+        "--inat-only-photos",
+        action="store_true",
+        help="When set, skip MPDB photo downloads and only fetch plant imagery from iNaturalist.",
+    )
+    parser.add_argument(
         "--format",
         choices=("json", "csv"),
         default="json",
@@ -2416,12 +2809,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         logging.info(
             "Photo download enabled. Detail pages will be fetched for plants even though they are not included in the output."
         )
+    if args.inat_only_photos and not args.download_photos:
+        logging.warning("--inat-only-photos has no effect unless --download-photos is also supplied.")
     crawler = MPDBCrawler(
         lang="en",
         delay=max(0.0, args.delay),
         timeout=args.timeout,
         download_photos=args.download_photos,
         photo_root=args.photo_dir,
+        inat_max_photos=args.inat_max_photos,
+        inat_request_delay=args.inat_request_delay,
+        inat_cache_ttl=args.inat_cache_ttl,
+        inat_only_photos=args.inat_only_photos,
     )
 
     results: List[CrawlResult] = []

@@ -49,6 +49,14 @@ def plot_confusion_matrix(y_true, y_pred, classes, save_path):
     plt.close(fig)
 
 def save_classification_report(y_true, y_pred, classes, save_path):
-    report = classification_report(y_true, y_pred, target_names=classes, digits=4)
+    labels = list(range(len(classes)))
+    report = classification_report(
+        y_true,
+        y_pred,
+        labels=labels,
+        target_names=classes,
+        digits=4,
+        zero_division=0,
+    )
     with open(save_path, "w") as f:
         f.write(report)
