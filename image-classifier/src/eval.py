@@ -2,7 +2,7 @@ import os
 import yaml
 import torch
 from tqdm import tqdm
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, f1_score
 from .data import build_testloader
 from .model import build_model
 from .utils import resolve_device, plot_confusion_matrix, save_classification_report
@@ -32,11 +32,22 @@ def main(cfg_path: str = "config.yaml"):
     model = build_model(cfg["model_name"], num_classes, pretrained=False).to(device)
     model.load_state_dict(ckpt["model_state"])
 
-    test_loader = build_testloader(cfg["test_dir"], cfg["img_size"], cfg["batch_size"], cfg["num_workers"], class_names)
+    data_cfg = getattr(model, "data_config", None)
+    test_loader = build_testloader(
+        cfg["test_dir"],
+        cfg["img_size"],
+        cfg["batch_size"],
+        cfg["num_workers"],
+        class_names,
+        data_cfg=data_cfg,
+        use_timm_augment=cfg.get("use_timm_augment", False)
+    )
 
     y_true, y_pred = evaluate(model, test_loader, device)
     acc = accuracy_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
     print(f"Test Accuracy: {acc:.4f}")
+    print(f"Test Macro F1: {f1:.4f}")
 
     os.makedirs(cfg["outputs_dir"], exist_ok=True)
     cm_path = os.path.join(cfg["outputs_dir"], "confusion_matrix.png")

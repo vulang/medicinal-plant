@@ -1,0 +1,81 @@
+<div class="app-shell">
+  <header class="app-header">
+    <div>
+      <h1>Tra cứu cây thuốc</h1>
+    </div>
+    <div class="status-pill" [class.busy]="isProcessing">
+      <span class="dot"></span>
+      {{ isProcessing ? 'Đang phân tích ảnh...' : 'Sẵn sàng' }}
+    </div>
+  </header>
+
+  <section class="chat-window" #scrollContainer>
+    <div *ngFor="let message of messages; trackBy: trackByMessageId" class="chat-row" [ngClass]="message.actor">
+      <div class="avatar" [attr.data-role]="message.actor">
+        {{ getActorLabel(message.actor) }}
+      </div>
+      <div class="bubble" [ngClass]="message.status">
+        <div class="bubble-header">
+          <span class="role">{{ getActorLabel(message.actor) }}</span>
+          <span class="timestamp">{{ message.timestamp | date:'shortTime' }}</span>
+        </div>
+        <p class="content">{{ message.content }}</p>
+
+        <img *ngIf="message.previewImageUrl" [src]="message.previewImageUrl" alt="Ảnh đã tải lên" class="preview" />
+
+        <div *ngIf="message.status === 'pending'" class="loading">
+          <span class="spinner"></span>
+          <span>Đang xử lý...</span>
+        </div>
+
+        <div *ngIf="message.prediction" class="prediction">
+          <p class="prediction-title">Độ tin cậy phân loại</p>
+          <div class="breakdown">
+            <div class="bar" *ngFor="let item of message.prediction.breakdown">
+              <div class="label">
+                <a
+                  [href]="getPlantLink(item.plantId)"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >{{ item.plantName }}</a>
+              </div>
+              <div class="meter">
+                <div class="fill" [style.width.%]="item.value * 100"></div>
+              </div>
+              <div class="value">{{ item.value * 100 | number:'1.0-1' }}%</div>
+            </div>
+          </div>
+        </div>
+
+        <div *ngIf="message.error" class="error-text">{{ message.error }}</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="composer">
+    <div
+      class="drop-zone"
+      [class.active]="dragActive"
+      (drop)="handleDrop($event)"
+      (dragover)="handleDragOver($event)"
+      (dragleave)="handleDragLeave($event)"
+    >
+      <input type="file" #fileInput accept="image/*" (change)="handleFileInput($event)" hidden />
+      <button class="upload-btn" (click)="fileInput.click()">Chọn ảnh</button>
+      <div class="drop-text">
+        <p *ngIf="!selectedFileName">Kéo thả ảnh lá cây tại đây hoặc bấm nút.</p>
+        <div *ngIf="selectedFileName" class="file-chip">
+          <span>{{ selectedFileName }}</span>
+          <span class="size">{{ selectedFileSize }}</span>
+          <button class="clear" (click)="removeSelectedFile()" aria-label="Xóa ảnh">&times;</button>
+        </div>
+      </div>
+      <img *ngIf="previewUrl" [src]="previewUrl" alt="Ảnh đang chờ xử lý" class="pending-preview" />
+    </div>
+    <button class="send-btn" [disabled]="!selectedFile || isProcessing" (click)="sendImage()">
+      {{ isProcessing ? 'Đang gửi...' : 'Gửi để nhận dạng' }}
+    </button>
+  </section>
+
+  <p *ngIf="errorMessage" class="error-banner">{{ errorMessage }}</p>
+</div>

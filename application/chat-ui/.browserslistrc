@@ -1,0 +1,7 @@
+# This file is used by the build system to adjust CSS and JS output for different browsers.
+# For more information, see https://angular.io/guide/browser-support
+
+last 2 Chrome versions
+last 2 Firefox versions
+last 2 Edge major versions
+Safari >= 16

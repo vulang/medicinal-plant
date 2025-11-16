@@ -4,42 +4,103 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.cuda.amp import autocast, GradScaler
+from sklearn.metrics import f1_score
 
 from .data import build_dataloaders
 from .model import build_model
 from .utils import set_seed, resolve_device
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
+
+def freeze_layers(model, freeze: bool = True):
+    """Freeze/unfreeze backbone layers for two-phase training."""
+    if hasattr(model, "features"):
+        modules = model.features
+    elif hasattr(model, "backbone"):
+        modules = model.backbone
+    else:
+        # Fallback: treat everything except final layer as backbone
+        children = list(model.children())
+        modules = children[:-1]
+
+    for module in modules if isinstance(modules, (list, tuple)) else [modules]:
+        for param in module.parameters():
+            param.requires_grad = not freeze
+
+
+def compute_topk_accuracy(outputs, labels, k: int = 5):
+    """Compute top-k accuracy."""
+    with torch.no_grad():
+        batch_size = labels.size(0)
+        k = min(k, outputs.size(1))
+        _, topk_preds = outputs.topk(k, dim=1, largest=True, sorted=True)
+        correct = topk_preds.eq(labels.view(-1, 1).expand_as(topk_preds))
+        return correct.any(dim=1).float().sum().item() / batch_size
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device, use_amp=True, max_grad_norm=1.0):
+    """Train for one epoch with optional mixed precision + grad clipping."""
     model.train()
     running_loss, correct, total = 0.0, 0, 0
+    top5_correct = 0.0
+    scaler = GradScaler() if use_amp and device.type == "cuda" else None
+
     for images, labels in tqdm(loader, desc="Train", leave=False):
         images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+
+        if scaler is not None:
+            with autocast():
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+            scaler.scale(loss).backward()
+            if max_grad_norm > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
 
         running_loss += loss.item() * images.size(0)
         preds = outputs.argmax(dim=1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
-    return running_loss / total, correct / total
+        top5_correct += compute_topk_accuracy(outputs, labels, k=5) * images.size(0)
+
+    return running_loss / total, correct / total, top5_correct / total
+
 
 @torch.no_grad()
 def validate(model, loader, criterion, device):
+    """Validate model."""
     model.eval()
     running_loss, correct, total = 0.0, 0, 0
+    top5_correct = 0.0
+    all_preds, all_labels = [], []
+
     for images, labels in tqdm(loader, desc="Val", leave=False):
         images, labels = images.to(device), labels.to(device)
         outputs = model(images)
         loss = criterion(outputs, labels)
+
         running_loss += loss.item() * images.size(0)
         preds = outputs.argmax(dim=1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
-    return running_loss / total, correct / total
+        top5_correct += compute_topk_accuracy(outputs, labels, k=5) * images.size(0)
+        all_preds.extend(preds.cpu().tolist())
+        all_labels.extend(labels.cpu().tolist())
+
+    val_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
+    return running_loss / total, correct / total, top5_correct / total, val_f1
+
 
 def main(cfg_path: str = "config.yaml"):
     with open(cfg_path, "r") as f:
@@ -50,46 +111,170 @@ def main(cfg_path: str = "config.yaml"):
     os.makedirs(cfg["save_dir"], exist_ok=True)
     os.makedirs(cfg["outputs_dir"], exist_ok=True)
 
-    train_loader, val_loader, class_names = build_dataloaders(
-        cfg["train_dir"], cfg["val_dir"], cfg["img_size"], cfg["batch_size"], cfg["num_workers"]
-    )
-    num_classes = len(class_names)
+    class_dirs = sorted(entry.name for entry in os.scandir(cfg["train_dir"]) if entry.is_dir())
+    if not class_dirs:
+        raise RuntimeError(f"No class folders found under {cfg['train_dir']}.")
+    num_classes = len(class_dirs)
+    print(f"Found {num_classes} classes.")
 
     model = build_model(cfg["model_name"], num_classes, pretrained=cfg.get("pretrained", True)).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = AdamW(model.parameters(), lr=cfg["learning_rate"], weight_decay=cfg["weight_decay"])
-    scheduler = CosineAnnealingLR(optimizer, T_max=cfg["epochs"])
+    data_cfg = getattr(model, "data_config", None)
+
+    train_loader, val_loader, class_names = build_dataloaders(
+        cfg["train_dir"],
+        cfg["val_dir"],
+        cfg["img_size"],
+        cfg["batch_size"],
+        cfg["num_workers"],
+        data_cfg=data_cfg,
+        use_timm_augment=cfg.get("use_timm_augment", False)
+    )
+    if class_names != class_dirs:
+        print("[WARN] Class order from dataloader differed from directory listing; using loader order.")
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=cfg.get("label_smoothing", 0.0))
+    optimizer = AdamW(
+        model.parameters(),
+        lr=cfg["learning_rate"],
+        weight_decay=cfg.get("weight_decay", 0.01)
+    )
+
+    warmup_epochs = cfg.get("warmup_epochs", 5)
+    total_epochs = cfg.get("epochs", 10)
+    if warmup_epochs > 0:
+        warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
+        main_scheduler = CosineAnnealingLR(optimizer, T_max=max(total_epochs - warmup_epochs, 1))
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, main_scheduler],
+            milestones=[warmup_epochs]
+        )
+    else:
+        scheduler = CosineAnnealingLR(optimizer, T_max=max(total_epochs, 1))
+
+    use_amp = cfg.get("use_amp", True) and device.type == "cuda"
+    max_grad_norm = cfg.get("max_grad_norm", 1.0)
+    warmup_phase1_epochs = cfg.get("warmup_epochs_phase1", 0)
+    patience = cfg.get("patience", 10)
 
     best_val_acc = 0.0
+    best_val_top5 = 0.0
+    best_val_f1 = 0.0
+    patience_counter = 0
     best_ckpt = os.path.join(cfg["save_dir"], f"{cfg['model_name']}_best.pt")
 
-    for epoch in range(1, cfg["epochs"] + 1):
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_acc = validate(model, val_loader, criterion, device)
+    print("=" * 70)
+    print("Training Configuration")
+    print(f"  Model: {cfg['model_name']}")
+    print(f"  Classes: {num_classes}")
+    print(f"  Device: {device}")
+    print(f"  Mixed Precision: {use_amp}")
+    print(f"  Phase1 (head) epochs: {warmup_phase1_epochs}")
+    print(f"  Total fine-tune epochs: {total_epochs}")
+    print(f"  Initial LR: {cfg['learning_rate']}")
+    print(f"  Weight Decay: {cfg.get('weight_decay', 0.01)}")
+    print(f"  Label Smoothing: {cfg.get('label_smoothing', 0.0)}")
+    print(f"  Early stop patience: {patience}")
+    print("=" * 70)
+
+    # Phase 1: train classifier head only
+    if warmup_phase1_epochs > 0:
+        print("\n" + "*" * 70)
+        print(f"PHASE 1: Training classifier head for {warmup_phase1_epochs} epochs")
+        print("*" * 70)
+        freeze_layers(model, freeze=True)
+
+        for epoch in range(1, warmup_phase1_epochs + 1):
+            train_loss, train_acc, train_top5 = train_one_epoch(
+                model, train_loader, criterion, optimizer, device, use_amp, max_grad_norm
+            )
+            val_loss, val_acc, val_top5, val_f1 = validate(model, val_loader, criterion, device)
+            scheduler.step()
+
+            lr = optimizer.param_groups[0]["lr"]
+            print(f"[Phase1] Epoch {epoch}/{warmup_phase1_epochs} | LR {lr:.2e} | "
+                  f"Train Loss {train_loss:.4f} Acc {train_acc:.4f} Top5 {train_top5:.4f} | "
+                  f"Val Loss {val_loss:.4f} Acc {val_acc:.4f} Top5 {val_top5:.4f} F1 {val_f1:.4f}")
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_val_top5 = val_top5
+                best_val_f1 = val_f1
+
+    # Phase 2: fine-tune entire network
+    print("\n" + "*" * 70)
+    print("PHASE 2: Fine-tuning all layers")
+    print("*" * 70)
+    freeze_layers(model, freeze=False)
+
+    finetune_lr = cfg.get("finetune_lr")
+    if finetune_lr:
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = finetune_lr
+        scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs)
+        print(f"Reduced LR to {finetune_lr:.2e} for fine-tuning.")
+
+    for epoch in range(1, total_epochs + 1):
+        train_loss, train_acc, train_top5 = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, use_amp, max_grad_norm
+        )
+        val_loss, val_acc, val_top5, val_f1 = validate(model, val_loader, criterion, device)
         scheduler.step()
 
-        print(f"Epoch {epoch}/{cfg['epochs']} | "
-              f"Train Loss {train_loss:.4f} Acc {train_acc:.4f} | "
-              f"Val Loss {val_loss:.4f} Acc {val_acc:.4f}")
+        lr = optimizer.param_groups[0]["lr"]
+        print(f"[Phase2] Epoch {epoch}/{total_epochs} | LR {lr:.2e} | "
+              f"Train Loss {train_loss:.4f} Acc {train_acc:.4f} Top5 {train_top5:.4f} | "
+              f"Val Loss {val_loss:.4f} Acc {val_acc:.4f} Top5 {val_top5:.4f} F1 {val_f1:.4f}")
 
-        # Save best
         if val_acc > best_val_acc:
             best_val_acc = val_acc
+            best_val_top5 = val_top5
+            best_val_f1 = val_f1
+            patience_counter = 0
             torch.save({
+                "epoch": warmup_phase1_epochs + epoch,
                 "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "best_val_acc": best_val_acc,
+                "best_val_top5": best_val_top5,
+                "best_val_f1": best_val_f1,
                 "classes": class_names,
                 "config": cfg
             }, best_ckpt)
+            print(f"  → Saved new best model (Val Acc {best_val_acc:.4f}, Top5 {best_val_top5:.4f}, F1 {best_val_f1:.4f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("=" * 70)
+                print(f"Early stopping triggered after {warmup_phase1_epochs + epoch} total epochs.")
+                print("=" * 70)
+                break
 
-    # Save last checkpoint
     last_ckpt = os.path.join(cfg["save_dir"], f"{cfg['model_name']}_last.pt")
-    torch.save({"model_state": model.state_dict(), "classes": class_names, "config": cfg}, last_ckpt)
-    print(f"Best val acc: {best_val_acc:.4f}. Saved best -> {best_ckpt}")
-    print(f"Saved last -> {last_ckpt}")
+    torch.save({
+        "epoch": warmup_phase1_epochs + epoch,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "val_acc": val_acc,
+        "val_top5": val_top5,
+        "val_f1": val_f1,
+        "classes": class_names,
+        "config": cfg
+    }, last_ckpt)
+
+    print("=" * 70)
+    print("Training complete")
+    print(f"  Best Val Accuracy: {best_val_acc:.4f}")
+    print(f"  Best Val Top-5 Accuracy: {best_val_top5:.4f}")
+    print(f"  Best Val F1 Score: {best_val_f1:.4f}")
+    print(f"  Best checkpoint: {best_ckpt}")
+    print(f"  Last checkpoint: {last_ckpt}")
+    print("=" * 70)
+
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Train medicinal plant classifier")
     parser.add_argument("--config", type=str, default="config.yaml")
     args = parser.parse_args()
     main(args.config)

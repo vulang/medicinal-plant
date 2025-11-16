@@ -4,3 +4,6 @@ __pycache__/
 image-classifier/data/**
 image-classifier/outputs/**
 crawler/photos/**
+bin/
+lib/
+classifier-venv/

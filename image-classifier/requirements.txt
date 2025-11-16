@@ -9,3 +9,4 @@ Pillow>=10.0.0
 PyYAML>=6.0.0
 tqdm>=4.66.0
 streamlit>=1.33.0
+timm>=0.9.8
