@@ -7,10 +7,26 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.cuda.amp import autocast, GradScaler
 from sklearn.metrics import f1_score
+import mlflow
 
 from .data import build_dataloaders
 from .model import build_model
 from .utils import set_seed, resolve_device
+
+
+def flatten_config(config, parent_key="", sep="."):
+    """Flatten nested config dictionaries so they can be logged to MLflow."""
+    items = {}
+    for key, value in config.items():
+        new_key = f"{parent_key}{sep}{key}" if parent_key else key
+        if isinstance(value, dict):
+            items.update(flatten_config(value, new_key, sep=sep))
+        else:
+            if isinstance(value, (list, tuple)):
+                items[new_key] = ",".join(map(str, value))
+            else:
+                items[new_key] = value
+    return items
 
 
 def freeze_layers(model, freeze: bool = True):
@@ -111,6 +127,23 @@ def main(cfg_path: str = "config.yaml"):
     os.makedirs(cfg["save_dir"], exist_ok=True)
     os.makedirs(cfg["outputs_dir"], exist_ok=True)
 
+    mlflow_cfg = cfg.get("mlflow") or {}
+    mlflow_enabled = mlflow_cfg.get("enabled", False)
+    artifact_subdir = mlflow_cfg.get("artifact_subdir") or "checkpoints"
+    mlflow_run = None
+    if mlflow_enabled:
+        tracking_uri = mlflow_cfg.get("tracking_uri")
+        if tracking_uri:
+            mlflow.set_tracking_uri(tracking_uri)
+        experiment_name = mlflow_cfg.get("experiment_name")
+        if experiment_name:
+            mlflow.set_experiment(experiment_name)
+        run_name = mlflow_cfg.get("run_name")
+        mlflow_run = mlflow.start_run(run_name=run_name)
+        tags = mlflow_cfg.get("tags")
+        if tags and isinstance(tags, dict):
+            mlflow.set_tags(tags)
+
     class_dirs = sorted(entry.name for entry in os.scandir(cfg["train_dir"]) if entry.is_dir())
     if not class_dirs:
         raise RuntimeError(f"No class folders found under {cfg['train_dir']}.")
@@ -131,6 +164,16 @@ def main(cfg_path: str = "config.yaml"):
     )
     if class_names != class_dirs:
         print("[WARN] Class order from dataloader differed from directory listing; using loader order.")
+
+    if mlflow_enabled:
+        params_to_log = flatten_config({k: v for k, v in cfg.items() if k != "mlflow"})
+        for key, value in params_to_log.items():
+            if value is None:
+                continue
+            mlflow.log_param(key, value)
+        mlflow.log_param("num_classes", num_classes)
+        mlflow.log_param("classes", ",".join(class_names))
+        mlflow.log_dict(cfg, os.path.join("configs", "config_used.yaml"))
 
     criterion = nn.CrossEntropyLoss(label_smoothing=cfg.get("label_smoothing", 0.0))
     optimizer = AdamW(
@@ -177,6 +220,12 @@ def main(cfg_path: str = "config.yaml"):
     print(f"  Early stop patience: {patience}")
     print("=" * 70)
 
+    global_epoch = 0
+
+    def log_epoch_metrics(step, metrics):
+        if mlflow_enabled:
+            mlflow.log_metrics(metrics, step=step)
+
     # Phase 1: train classifier head only
     if warmup_phase1_epochs > 0:
         print("\n" + "*" * 70)
@@ -200,6 +249,18 @@ def main(cfg_path: str = "config.yaml"):
                 best_val_acc = val_acc
                 best_val_top5 = val_top5
                 best_val_f1 = val_f1
+
+            log_epoch_metrics(global_epoch + 1, {
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "train_top5": train_top5,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "val_top5": val_top5,
+                "val_f1": val_f1,
+                "learning_rate": lr,
+            })
+            global_epoch += 1
 
     # Phase 2: fine-tune entire network
     print("\n" + "*" * 70)
@@ -226,6 +287,18 @@ def main(cfg_path: str = "config.yaml"):
               f"Train Loss {train_loss:.4f} Acc {train_acc:.4f} Top5 {train_top5:.4f} | "
               f"Val Loss {val_loss:.4f} Acc {val_acc:.4f} Top5 {val_top5:.4f} F1 {val_f1:.4f}")
 
+        log_epoch_metrics(global_epoch + 1, {
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "train_top5": train_top5,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+            "val_top5": val_top5,
+            "val_f1": val_f1,
+            "learning_rate": lr,
+        })
+        global_epoch += 1
+
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_val_top5 = val_top5
@@ -242,6 +315,13 @@ def main(cfg_path: str = "config.yaml"):
                 "config": cfg
             }, best_ckpt)
             print(f"  → Saved new best model (Val Acc {best_val_acc:.4f}, Top5 {best_val_top5:.4f}, F1 {best_val_f1:.4f})")
+            if mlflow_enabled:
+                mlflow.log_metrics({
+                    "best_val_acc": best_val_acc,
+                    "best_val_top5": best_val_top5,
+                    "best_val_f1": best_val_f1,
+                }, step=global_epoch)
+                mlflow.log_artifact(best_ckpt, artifact_path=artifact_subdir)
         else:
             patience_counter += 1
             if patience_counter >= patience:
@@ -261,6 +341,8 @@ def main(cfg_path: str = "config.yaml"):
         "classes": class_names,
         "config": cfg
     }, last_ckpt)
+    if mlflow_enabled:
+        mlflow.log_artifact(last_ckpt, artifact_path=artifact_subdir)
 
     print("=" * 70)
     print("Training complete")
@@ -270,6 +352,19 @@ def main(cfg_path: str = "config.yaml"):
     print(f"  Best checkpoint: {best_ckpt}")
     print(f"  Last checkpoint: {last_ckpt}")
     print("=" * 70)
+
+    if mlflow_enabled:
+        mlflow.log_metrics({
+            "final_val_acc": val_acc,
+            "final_val_top5": val_top5,
+            "final_val_f1": val_f1,
+            "best_val_acc": best_val_acc,
+            "best_val_top5": best_val_top5,
+            "best_val_f1": best_val_f1,
+        }, step=global_epoch)
+
+    if mlflow_run is not None:
+        mlflow.end_run()
 
 
 if __name__ == "__main__":

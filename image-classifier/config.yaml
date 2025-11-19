@@ -27,3 +27,10 @@ finetune_lr: null        # set to a float (e.g., 0.0001) to drop LR before fine-
 device: cuda           # auto | cpu | cuda | mps
 save_dir: models
 outputs_dir: outputs
+
+mlflow:
+  enabled: true
+  tracking_uri: null      # e.g., http://127.0.0.1:5000 or leave null for local ./mlruns
+  experiment_name: medicinal-plants
+  run_name: null          # optionally override per run
+  artifact_subdir: checkpoints

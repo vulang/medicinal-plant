@@ -7,3 +7,4 @@ crawler/photos/**
 bin/
 lib/
 classifier-venv/
+mlruns/
