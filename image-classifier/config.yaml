@@ -6,12 +6,12 @@ val_dir: data/val
 test_dir: data/test
 
 img_size: 224
-batch_size: 32
+batch_size: 128
 num_workers: 2
 
-model_name: resnet18   # choices: resnet18, resnet50, efficientnet_b0, mobilenet_v3_small, convnext_tiny/small/base/large, convnextv2_base.fcmae_ft_in22k_in1k
+model_name: resnet50   # choices: resnet18, resnet50, efficientnet_b0, mobilenet_v3_small, convnext_tiny/small/base/large, convnextv2_base.fcmae_ft_in22k_in1k, vit_base_patch16_224 (or other timm vit/deit/swin)
 pretrained: true
-use_timm_augment: false   # set true to use timm's RandomResizedCrop-style augmentation (more aggressive)
+use_timm_augment: true   # set true to use timm's RandomResizedCrop-style augmentation (more aggressive)
 
 epochs: 40
 learning_rate: 0.0005
@@ -23,6 +23,11 @@ patience: 10
 use_amp: true
 max_grad_norm: 1.0
 finetune_lr: null        # set to a float (e.g., 0.0001) to drop LR before fine-tuning all layers
+mixup_alpha: 0.4         # >0 enables mixup
+cutmix_alpha: 1.0        # >0 enables cutmix
+mixup_prob: 0.6          # probability of applying mixup/cutmix to a batch
+mixup_switch_prob: 0.5   # probability of switching to the other augmentation at runtime
+mixup_mode: batch        # batch | pair | elem
 
 device: cuda           # auto | cpu | cuda | mps
 save_dir: models

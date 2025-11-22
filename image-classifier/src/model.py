@@ -10,6 +10,15 @@ except ImportError:
     timm = None
     resolve_model_data_config = None
 
+def _build_timm_model(model_name: str, num_classes: int, pretrained: bool):
+    if timm is None:
+        raise ImportError(f"timm is required for {model_name}. Install it with `pip install timm`.")
+    if resolve_model_data_config is None:
+        raise ImportError("timm>=0.9 is required for data config resolution.")
+    model = timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes)
+    model.data_config = resolve_model_data_config(model)
+    return model
+
 def _attach_default_data_config(model, img_size: int = 224):
     model.data_config = {
         "input_size": (3, img_size, img_size),
@@ -70,11 +79,7 @@ def build_model(model_name: str, num_classes: int, pretrained: bool = True):
         _attach_default_data_config(m, 224)
         return m
     if model_name == "convnextv2_base.fcmae_ft_in22k_in1k":
-        if timm is None:
-            raise ImportError("timm is required for ConvNeXt V2 models. Install it with `pip install timm`.")
-        m = timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes)
-        if resolve_model_data_config is None:
-            raise ImportError("timm>=0.9 is required for ConvNeXt V2 data config resolution.")
-        m.data_config = resolve_model_data_config(m)
-        return m
+        return _build_timm_model(model_name, num_classes, pretrained)
+    if model_name.startswith(("vit_", "deit_", "swin_", "beit_")):
+        return _build_timm_model(model_name, num_classes, pretrained)
     raise ValueError(f"Unknown model_name: {model_name}")

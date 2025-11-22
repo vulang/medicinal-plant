@@ -17,7 +17,7 @@ export class AppComponent {
     {
       id: this.createId(),
       actor: 'system',
-      content: 'Hãy tải ảnh cây lên và tôi sẽ cho bạn biết đó là loài nào.',
+      content: 'Vui lòng tải ảnh lên.',
       timestamp: new Date()
     }
   ];
@@ -86,7 +86,7 @@ export class AppComponent {
     const pendingAssistant: ChatMessage = {
       id: this.createId(),
       actor: 'assistant',
-      content: 'Đang phân tích ảnh của bạn...',
+      content: 'Đang phân tích ảnh...',
       timestamp: new Date(),
       status: 'pending'
     };
@@ -160,7 +160,7 @@ export class AppComponent {
   private handlePredictionError(message: ChatMessage, error: unknown): void {
     console.error('Prediction error', error);
     message.status = 'error';
-    message.content = 'Tôi không thể phân loại ảnh này.';
+    message.content = 'Không thể phân loại ảnh này.';
     message.error = this.extractErrorMessage(error);
     this.errorMessage = message.error;
     this.messages = [...this.messages];

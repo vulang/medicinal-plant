@@ -5,9 +5,16 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.cuda.amp import autocast, GradScaler
+from torch import amp
 from sklearn.metrics import f1_score
 import mlflow
+
+try:
+    from timm.data import Mixup
+    from timm.loss import SoftTargetCrossEntropy
+except ImportError:
+    Mixup = None
+    SoftTargetCrossEntropy = None
 
 from .data import build_dataloaders
 from .model import build_model
@@ -55,21 +62,40 @@ def compute_topk_accuracy(outputs, labels, k: int = 5):
         return correct.any(dim=1).float().sum().item() / batch_size
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, use_amp=True, max_grad_norm=1.0):
-    """Train for one epoch with optional mixed precision + grad clipping."""
+def train_one_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    device,
+    use_amp=True,
+    max_grad_norm=1.0,
+    mixup_fn=None
+):
+    """Train for one epoch with optional mixed precision, mixup/cutmix, and grad clipping."""
     model.train()
     running_loss, correct, total = 0.0, 0, 0
     top5_correct = 0.0
-    scaler = GradScaler() if use_amp and device.type == "cuda" else None
+    scaler = amp.GradScaler(device.type) if use_amp and device.type == "cuda" else None
 
     for images, labels in tqdm(loader, desc="Train", leave=False):
-        images, labels = images.to(device), labels.to(device)
+        batch_images, batch_labels = images.to(device), labels.to(device)
+
+        if mixup_fn is not None and batch_images.size(0) % 2 != 0:
+            # timm Mixup requires an even batch size; trim one sample if needed.
+            batch_images = batch_images[:-1]
+            batch_labels = batch_labels[:-1]
+            if batch_images.numel() == 0:
+                continue
+
+        inputs, targets = (mixup_fn(batch_images, batch_labels) if mixup_fn is not None
+                           else (batch_images, batch_labels))
         optimizer.zero_grad()
 
         if scaler is not None:
-            with autocast():
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+            with amp.autocast(device_type=device.type):
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
             scaler.scale(loss).backward()
             if max_grad_norm > 0:
                 scaler.unscale_(optimizer)
@@ -77,18 +103,19 @@ def train_one_epoch(model, loader, criterion, optimizer, device, use_amp=True, m
             scaler.step(optimizer)
             scaler.update()
         else:
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
             loss.backward()
             if max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
 
-        running_loss += loss.item() * images.size(0)
+        batch_size = batch_labels.size(0)
+        running_loss += loss.item() * batch_size
         preds = outputs.argmax(dim=1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
-        top5_correct += compute_topk_accuracy(outputs, labels, k=5) * images.size(0)
+        correct += (preds == batch_labels).sum().item()
+        total += batch_size
+        top5_correct += compute_topk_accuracy(outputs, batch_labels, k=5) * batch_size
 
     return running_loss / total, correct / total, top5_correct / total
 
@@ -153,6 +180,16 @@ def main(cfg_path: str = "config.yaml"):
     model = build_model(cfg["model_name"], num_classes, pretrained=cfg.get("pretrained", True)).to(device)
     data_cfg = getattr(model, "data_config", None)
 
+    mixup_alpha = cfg.get("mixup_alpha", 0.0)
+    cutmix_alpha = cfg.get("cutmix_alpha", 0.0)
+    mixup_prob = cfg.get("mixup_prob", 0.0)
+    mixup_switch_prob = cfg.get("mixup_switch_prob", 0.5)
+    mixup_mode = cfg.get("mixup_mode", "batch")
+    mixup_active = (mixup_alpha > 0 or cutmix_alpha > 0) and mixup_prob > 0
+    if mixup_active and cfg["batch_size"] % 2 != 0:
+        print(f"[WARN] Mixup/CutMix enabled but batch_size ({cfg['batch_size']}) is odd. "
+              "Dropping the last sample of odd batches to keep pairs.")
+
     train_loader, val_loader, class_names = build_dataloaders(
         cfg["train_dir"],
         cfg["val_dir"],
@@ -160,7 +197,9 @@ def main(cfg_path: str = "config.yaml"):
         cfg["batch_size"],
         cfg["num_workers"],
         data_cfg=data_cfg,
-        use_timm_augment=cfg.get("use_timm_augment", False)
+        use_timm_augment=cfg.get("use_timm_augment", False),
+        drop_last_train=mixup_active,
+        drop_last_val=False
     )
     if class_names != class_dirs:
         print("[WARN] Class order from dataloader differed from directory listing; using loader order.")
@@ -175,7 +214,23 @@ def main(cfg_path: str = "config.yaml"):
         mlflow.log_param("classes", ",".join(class_names))
         mlflow.log_dict(cfg, os.path.join("configs", "config_used.yaml"))
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=cfg.get("label_smoothing", 0.0))
+    mixup_fn = None
+    if mixup_active:
+        if Mixup is None or SoftTargetCrossEntropy is None:
+            raise ImportError("timm is required for mixup/cutmix training. Install it with `pip install timm`.")
+        mixup_fn = Mixup(
+            mixup_alpha=mixup_alpha,
+            cutmix_alpha=cutmix_alpha,
+            prob=mixup_prob,
+            switch_prob=mixup_switch_prob,
+            mode=mixup_mode,
+            label_smoothing=cfg.get("label_smoothing", 0.0),
+            num_classes=num_classes
+        )
+        train_criterion = SoftTargetCrossEntropy()
+    else:
+        train_criterion = nn.CrossEntropyLoss(label_smoothing=cfg.get("label_smoothing", 0.0))
+    val_criterion = nn.CrossEntropyLoss(label_smoothing=cfg.get("label_smoothing", 0.0))
     optimizer = AdamW(
         model.parameters(),
         lr=cfg["learning_rate"],
@@ -218,6 +273,9 @@ def main(cfg_path: str = "config.yaml"):
     print(f"  Weight Decay: {cfg.get('weight_decay', 0.01)}")
     print(f"  Label Smoothing: {cfg.get('label_smoothing', 0.0)}")
     print(f"  Early stop patience: {patience}")
+    if mixup_active:
+        print(f"  Mixup/CutMix: mixup_alpha={mixup_alpha}, cutmix_alpha={cutmix_alpha}, prob={mixup_prob}, "
+              f"switch_prob={mixup_switch_prob}, mode={mixup_mode}")
     print("=" * 70)
 
     global_epoch = 0
@@ -235,9 +293,9 @@ def main(cfg_path: str = "config.yaml"):
 
         for epoch in range(1, warmup_phase1_epochs + 1):
             train_loss, train_acc, train_top5 = train_one_epoch(
-                model, train_loader, criterion, optimizer, device, use_amp, max_grad_norm
+                model, train_loader, train_criterion, optimizer, device, use_amp, max_grad_norm, mixup_fn
             )
-            val_loss, val_acc, val_top5, val_f1 = validate(model, val_loader, criterion, device)
+            val_loss, val_acc, val_top5, val_f1 = validate(model, val_loader, val_criterion, device)
             scheduler.step()
 
             lr = optimizer.param_groups[0]["lr"]
@@ -277,9 +335,9 @@ def main(cfg_path: str = "config.yaml"):
 
     for epoch in range(1, total_epochs + 1):
         train_loss, train_acc, train_top5 = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, use_amp, max_grad_norm
+            model, train_loader, train_criterion, optimizer, device, use_amp, max_grad_norm, mixup_fn
         )
-        val_loss, val_acc, val_top5, val_f1 = validate(model, val_loader, criterion, device)
+        val_loss, val_acc, val_top5, val_f1 = validate(model, val_loader, val_criterion, device)
         scheduler.step()
 
         lr = optimizer.param_groups[0]["lr"]

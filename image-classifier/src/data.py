@@ -107,7 +107,9 @@ def build_dataloaders(
     batch_size: int,
     num_workers: int,
     data_cfg: Optional[Dict[str, Any]] = None,
-    use_timm_augment: bool = False
+    use_timm_augment: bool = False,
+    drop_last_train: bool = False,
+    drop_last_val: bool = False
 ):
     collate = _clone_collate
     # Some classes currently have empty folders; allow_empty avoids hard failures while keeping class ordering consistent.
@@ -130,14 +132,16 @@ def build_dataloaders(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        collate_fn=collate
+        collate_fn=collate,
+        drop_last=drop_last_train
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=collate
+        collate_fn=collate,
+        drop_last=drop_last_val
     )
     return train_loader, val_loader, class_names
 
