@@ -3,6 +3,7 @@ import yaml
 from tqdm import tqdm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch import amp
@@ -60,6 +61,36 @@ def compute_topk_accuracy(outputs, labels, k: int = 5):
         _, topk_preds = outputs.topk(k, dim=1, largest=True, sorted=True)
         correct = topk_preds.eq(labels.view(-1, 1).expand_as(topk_preds))
         return correct.any(dim=1).float().sum().item() / batch_size
+
+
+class FocalLoss(nn.Module):
+    """Standard focal loss for hard labels."""
+
+    def __init__(self, gamma: float = 2.0, alpha: float | None = None, reduction: str = "mean"):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        log_probs = F.log_softmax(inputs, dim=1)
+        probs = log_probs.exp()
+        targets = targets.long()
+
+        log_pt = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        pt = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+        alpha_factor = 1.0
+        if self.alpha is not None:
+            alpha_factor = self.alpha
+
+        loss = -alpha_factor * ((1 - pt) ** self.gamma) * log_pt
+
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss
 
 
 def train_one_epoch(
@@ -199,7 +230,8 @@ def main(cfg_path: str = "config.yaml"):
         data_cfg=data_cfg,
         use_timm_augment=cfg.get("use_timm_augment", False),
         drop_last_train=mixup_active,
-        drop_last_val=False
+        drop_last_val=False,
+        use_weighted_sampler=cfg.get("use_weighted_sampler", False)
     )
     if class_names != class_dirs:
         print("[WARN] Class order from dataloader differed from directory listing; using loader order.")
@@ -229,7 +261,15 @@ def main(cfg_path: str = "config.yaml"):
         )
         train_criterion = SoftTargetCrossEntropy()
     else:
-        train_criterion = nn.CrossEntropyLoss(label_smoothing=cfg.get("label_smoothing", 0.0))
+        loss_type = cfg.get("loss_type", "cross_entropy")
+        if loss_type == "focal":
+            train_criterion = FocalLoss(
+                gamma=cfg.get("focal_gamma", 2.0),
+                alpha=cfg.get("focal_alpha"),
+                reduction="mean",
+            )
+        else:
+            train_criterion = nn.CrossEntropyLoss(label_smoothing=cfg.get("label_smoothing", 0.0))
     val_criterion = nn.CrossEntropyLoss(label_smoothing=cfg.get("label_smoothing", 0.0))
     optimizer = AdamW(
         model.parameters(),

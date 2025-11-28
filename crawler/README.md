@@ -67,6 +67,7 @@ Useful flags:
 - `--limit N` pull only the first `N` rows (handy for testing).
 - `--delay SECONDS` adjust the pause between requests (default `0.5`).
 - `--timeout SECONDS` change the HTTP timeout (default `30`).
+- `--low-support-report path/to/classification_report.txt` only download plant photos for class IDs whose support is below `--low-support-threshold` (default `50`), useful for backfilling underrepresented classes from a model report.
 - `-v/--verbose` emit debug logging.
 
 When using CSV output and multiple categories, pass a directory path to `--output`; per-category CSV files will be created inside it.

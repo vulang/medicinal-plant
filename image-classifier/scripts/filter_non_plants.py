@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""
+Filter crawler downloads to keep only images that likely contain plants.
+
+Uses OpenCLIP zero-shot classification ("plant" vs "not a plant") and copies
+accepted files into a destination folder, preserving class subdirectories.
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+from pathlib import Path
+from typing import Iterable, Tuple
+
+import torch
+import numpy as np
+import cv2
+from PIL import Image
+
+try:
+    import open_clip
+except ImportError as exc:  # pragma: no cover - convenience message
+    raise ImportError(
+        "open_clip_torch is required. Install with `pip install open_clip_torch`."
+    ) from exc
+
+
+PLANT_PROMPTS = [
+    "a photo of a medicinal plant",
+    "a photo of an herb plant",
+    "a close-up photo of plant leaves",
+    "a photo of a plant in nature",
+]
+NON_PLANT_PROMPTS = [
+    "a photo of an animal",
+    "a photo of a person",
+    "a photo of an object that is not a plant",
+    "a photo of a building",
+    "a photo of a hand",
+]
+VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Copy images that look like plants into a filtered folder."
+    )
+    repo_root = Path(__file__).resolve().parents[1]
+    parser.add_argument(
+        "--source",
+        type=Path,
+        default=repo_root / "crawler" / "photos" / "plants",
+        help="Source folder containing class subdirectories (default: ../crawler/photos/plants).",
+    )
+    parser.add_argument(
+        "--destination",
+        type=Path,
+        default=repo_root / "image-classifier" / "data" / "filtered",
+        help="Destination root to store filtered images (default: ./image-classifier/data/filtered).",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.65,
+        help="Minimum plant probability to keep an image (default: 0.65).",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=64,
+        help="Batch size for model inference (default: 64).",
+    )
+    parser.add_argument(
+        "--min-laplacian-var",
+        type=float,
+        default=30.0,
+        help="Minimum variance of Laplacian (blur threshold). Lower rejects blurrier images.",
+    )
+    parser.add_argument(
+        "--min-contrast",
+        type=float,
+        default=0.03,
+        help="Minimum grayscale contrast (p99-p1 normalized) to keep an image (default: 0.03).",
+    )
+    parser.add_argument(
+        "--aesthetic-threshold",
+        type=float,
+        default=0.20,
+        help="Minimum aesthetic probability (CLIP high-quality vs low-quality) to keep an image (default: 0.20).",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Device to use: auto|cuda|cpu (default: auto).",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="ViT-B-32",
+        help="OpenCLIP model name (default: ViT-B-32).",
+    )
+    parser.add_argument(
+        "--pretrained",
+        type=str,
+        default="laion2b_s34b_b79k",
+        help="OpenCLIP pretrained tag (default: laion2b_s34b_b79k).",
+    )
+    parser.add_argument(
+        "--move",
+        action="store_true",
+        help="Move files instead of copying (saves disk, destructive).",
+    )
+    return parser.parse_args()
+
+
+def get_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
+
+
+def load_model(model_name: str, pretrained: str, device: torch.device):
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        model_name, pretrained=pretrained
+    )
+    tokenizer = open_clip.get_tokenizer(model_name)
+    model.to(device)
+    model.eval()
+    with torch.no_grad():
+        plant_tokens = tokenizer(PLANT_PROMPTS).to(device)
+        non_plant_tokens = tokenizer(NON_PLANT_PROMPTS).to(device)
+        plant_feat = model.encode_text(plant_tokens).float()
+        non_plant_feat = model.encode_text(non_plant_tokens).float()
+        plant_feat = (plant_feat / plant_feat.norm(dim=-1, keepdim=True)).mean(dim=0)
+        non_plant_feat = (non_plant_feat / non_plant_feat.norm(dim=-1, keepdim=True)).mean(dim=0)
+        text_features = torch.stack(
+            [
+                plant_feat / plant_feat.norm(),
+                non_plant_feat / non_plant_feat.norm(),
+            ],
+            dim=0,
+        )
+        # Aesthetic prompts (high vs low quality)
+        aesthetic_tokens = tokenizer(
+            ["a high quality, well-lit photo", "a low quality, blurry photo"]
+        ).to(device)
+        aesthetic_feat = model.encode_text(aesthetic_tokens).float()
+        aesthetic_feat = aesthetic_feat / aesthetic_feat.norm(dim=-1, keepdim=True)
+    return model, preprocess, text_features, aesthetic_feat
+
+
+def iter_image_files(class_dir: Path) -> Iterable[Path]:
+    for path in sorted(class_dir.iterdir()):
+        if path.is_file() and path.suffix.lower() in VALID_EXTS:
+            yield path
+
+
+def quality_checks(path: Path, min_lap_var: float, min_contrast: float) -> Tuple[bool, float, float]:
+    """Return (pass, lap_var, contrast)."""
+    data = path.read_bytes()
+    img_array = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return False, 0.0, 0.0
+    lap_var = float(cv2.Laplacian(img, cv2.CV_64F).var())
+    p1, p99 = np.percentile(img, [1, 99])
+    contrast = float((p99 - p1) / 255.0)
+    ok = lap_var >= min_lap_var and contrast >= min_contrast
+    return ok, lap_var, contrast
+
+
+def score_batch(
+    model,
+    preprocess,
+    text_features: torch.Tensor,
+    aesthetic_features: torch.Tensor,
+    batch: list[Path],
+    device: torch.device,
+) -> list[float]:
+    images = []
+    for path in batch:
+        try:
+            img = Image.open(path).convert("RGB")
+        except Exception:
+            images.append(None)
+            continue
+        images.append(preprocess(img))
+    valid_indices = [i for i, img in enumerate(images) if img is not None]
+    if not valid_indices:
+        return [0.0] * len(batch)
+    batch_tensor = torch.stack([images[i] for i in valid_indices]).to(device)
+    with torch.no_grad():
+        image_features = model.encode_image(batch_tensor).float()
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        logits = (model.logit_scale.exp() * image_features @ text_features.T)
+        probs = logits.softmax(dim=1)[:, 0].cpu().tolist()
+        aesthetic_logits = (model.logit_scale.exp() * image_features @ aesthetic_features.T)
+        aesthetic_probs = aesthetic_logits.softmax(dim=1)[:, 0].cpu().tolist()
+    scores = [0.0] * len(batch)
+    aesthetic_scores = [0.0] * len(batch)
+    for idx, prob in zip(valid_indices, probs):
+        scores[idx] = prob
+    for idx, prob in zip(valid_indices, aesthetic_probs):
+        aesthetic_scores[idx] = prob
+    return list(zip(scores, aesthetic_scores))
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def copy_or_move(src: Path, dst: Path, move: bool) -> None:
+    ensure_dir(dst.parent)
+    if move:
+        shutil.move(str(src), str(dst))
+    else:
+        shutil.copy2(src, dst)
+
+
+def filter_class(
+    class_dir: Path,
+    dst_root: Path,
+    model,
+    preprocess,
+    text_features: torch.Tensor,
+    aesthetic_features: torch.Tensor,
+    device: torch.device,
+    batch_size: int,
+    threshold: float,
+    aesthetic_threshold: float,
+    min_lap_var: float,
+    min_contrast: float,
+    move: bool,
+) -> tuple[int, int]:
+    files = list(iter_image_files(class_dir))
+    kept = 0
+    for i in range(0, len(files), batch_size):
+        batch = files[i : i + batch_size]
+        quality_pass = []
+        for path in batch:
+            ok, _, _ = quality_checks(path, min_lap_var, min_contrast)
+            quality_pass.append(ok)
+
+        scored = score_batch(model, preprocess, text_features, aesthetic_features, batch, device)
+        for path, (plant_prob, aesth_prob), q_ok in zip(batch, scored, quality_pass):
+            if q_ok and plant_prob >= threshold and aesth_prob >= aesthetic_threshold:
+                dst = dst_root / class_dir.name / path.name
+                copy_or_move(path, dst, move)
+                kept += 1
+    return kept, len(files)
+
+
+def main() -> None:
+    args = parse_args()
+    device = get_device(args.device)
+    if not args.source.exists():
+        raise FileNotFoundError(f"Source directory not found: {args.source}")
+    ensure_dir(args.destination)
+
+    print(f"Loading OpenCLIP {args.model} ({args.pretrained}) on {device}...")
+    model, preprocess, text_features, aesthetic_features = load_model(args.model, args.pretrained, device)
+
+    class_dirs = [p for p in sorted(args.source.iterdir()) if p.is_dir()]
+    if not class_dirs:
+        raise RuntimeError(f"No class folders found under {args.source}")
+
+    total_kept = 0
+    total_seen = 0
+    for class_dir in class_dirs:
+        kept, seen = filter_class(
+            class_dir,
+            args.destination,
+            model,
+            preprocess,
+            text_features,
+            aesthetic_features,
+            device,
+            args.batch_size,
+            args.threshold,
+            args.aesthetic_threshold,
+            args.min_laplacian_var,
+            args.min_contrast,
+            args.move,
+        )
+        total_kept += kept
+        total_seen += seen
+        print(f"{class_dir.name}: kept {kept}/{seen} ({(kept/seen*100 if seen else 0):.1f}%)")
+
+    print(
+        f"Done. Kept {total_kept}/{total_seen} images "
+        f"({(total_kept/total_seen*100 if total_seen else 0):.1f}%) "
+        f"into '{args.destination}'."
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -96,6 +96,25 @@ def _get_http_logger(category: Optional[str]) -> logging.Logger:
     _HTTP_ERROR_LOGGERS[normalized] = http_logger
     return http_logger
 
+
+def parse_classification_report(report_path: Path, min_support: int) -> Set[str]:
+    """Return class IDs from a sklearn classification report whose support is below the threshold."""
+    threshold = max(0, int(min_support))
+    low_support: Set[str] = set()
+    line_re = re.compile(r"^\s*(\S+)\s+[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+(\d+)\s*$")
+    for line in report_path.read_text(encoding="utf-8").splitlines():
+        match = line_re.match(line)
+        if not match:
+            continue
+        class_id, support_text = match.groups()
+        try:
+            support = int(support_text)
+        except ValueError:
+            continue
+        if support < threshold:
+            low_support.add(class_id)
+    return low_support
+
 _URL_PATTERN = re.compile(r"(https?://\S+|ftp://\S+|www\.\S+)", re.IGNORECASE)
 _JP_IDENT_PHOTO_URL_PATTERN = re.compile(
     r"get_image\.cgi\?table=jp_identification_photo_data&column=jp_identification_photo_file&id=(\d+)",
@@ -136,6 +155,7 @@ class MPDBCrawler:
         inat_request_delay: float = INAT_DEFAULT_REQUEST_DELAY,
         inat_cache_ttl: float = INAT_DEFAULT_CACHE_TTL,
         inat_only_photos: bool = False,
+        plant_photo_id_whitelist: Optional[Set[str]] = None,
     ):
         self.lang = lang
         self.delay = delay
@@ -146,6 +166,11 @@ class MPDBCrawler:
         self.inat_request_delay = max(0.0, float(inat_request_delay))
         self.inat_cache_ttl = max(0.0, float(inat_cache_ttl))
         self.inat_only_photos = inat_only_photos
+        self.plant_photo_id_whitelist = (
+            {normalise_text(str(value)) for value in plant_photo_id_whitelist if normalise_text(str(value))}
+            if plant_photo_id_whitelist
+            else None
+        )
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -159,6 +184,15 @@ class MPDBCrawler:
         self._inat_taxon_cache: Dict[str, Tuple[float, Optional[int]]] = {}
         self._inat_last_request: float = 0.0
         self._inat_completed_identifiers: Set[str] = set()
+
+    def _should_download_plant_photos(self, identifier: Optional[str]) -> bool:
+        """Return True when plant photo downloads should proceed for this identifier."""
+        if self.plant_photo_id_whitelist is None:
+            return True
+        normalized = normalise_text(str(identifier)) if identifier is not None else ""
+        if not normalized:
+            return False
+        return normalized in self.plant_photo_id_whitelist
 
     def crawl(
         self,
@@ -476,12 +510,26 @@ class MPDBCrawler:
             if entry_id and "id" not in entry:
                 entry["id"] = entry_id
 
+            photo_identifier: Optional[str] = None
+            should_attempt_photos = self.download_photos and bool(detail_url)
+            if should_attempt_photos and category == "plant":
+                try:
+                    photo_identifier = self._derive_photo_identifier(category, row_data, detail_data)
+                except Exception:
+                    photo_identifier = None
+                if not self._should_download_plant_photos(photo_identifier):
+                    logging.info(
+                        "Skipping photo download for plant %s due to low-support filter",
+                        photo_identifier or row_data.get("ID") or "unknown",
+                    )
+                    should_attempt_photos = False
+
             if include_details and detail_url:
                 time.sleep(self.delay)
                 detail_data = self._filter_detail_fields(category, self._fetch_detail(detail_url, category=category))
                 entry["detail"] = detail_data
 
-            if self.download_photos and detail_url:
+            if should_attempt_photos:
                 if detail_data is None:
                     time.sleep(self.delay)
                     detail_data = self._filter_detail_fields(category, self._fetch_detail(detail_url, category=category))
@@ -489,9 +537,10 @@ class MPDBCrawler:
                         entry["detail"] = detail_data
                 photos = detail_data.get("photos") if detail_data else None
                 if photos:
-                    identifier = self._derive_photo_identifier(category, row_data, detail_data)
-                    if identifier:
-                        self._download_photos_for_category(category, identifier, photos)
+                    if not photo_identifier:
+                        photo_identifier = self._derive_photo_identifier(category, row_data, detail_data)
+                    if photo_identifier:
+                        self._download_photos_for_category(category, photo_identifier, photos)
 
             items.append(entry)
 
@@ -2089,6 +2138,9 @@ class MPDBCrawler:
             return
         if not identifier:
             return
+        if not self._should_download_plant_photos(identifier):
+            logging.debug("Skipping iNaturalist photos for %s due to low-support filter", identifier)
+            return
         candidate_names = self._inat_prepare_candidate_names(names)
         if not candidate_names:
             return
@@ -2410,6 +2462,12 @@ class MPDBCrawler:
         source: str = "mpdb",
     ) -> None:
         """Download photos into the configured directory for a specific category."""
+        if category == "plant" and not self._should_download_plant_photos(identifier):
+            logging.info(
+                "Skipping plant photo download for %s due to low-support filter",
+                identifier or "unknown",
+            )
+            return
         if self.inat_only_photos and source != "inat":
             logging.debug(
                 "Skipping MPDB photo download for %s/%s due to --inat-only-photos",
@@ -2753,6 +2811,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Root output directory for downloaded photos (default: ./photos).",
     )
     parser.add_argument(
+        "--low-support-report",
+        type=Path,
+        help="When set, only download plant photos for classes whose support is below the threshold in this classification_report.txt file.",
+    )
+    parser.add_argument(
+        "--low-support-threshold",
+        type=int,
+        default=50,
+        help="Support threshold for --low-support-report filtering (default: 50).",
+    )
+    parser.add_argument(
         "--inat-max-photos",
         type=int,
         default=INAT_DEFAULT_MAX_PHOTOS,
@@ -2811,6 +2880,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     if args.inat_only_photos and not args.download_photos:
         logging.warning("--inat-only-photos has no effect unless --download-photos is also supplied.")
+
+    plant_photo_id_whitelist: Optional[Set[str]] = None
+    if args.low_support_report:
+        try:
+            plant_photo_id_whitelist = parse_classification_report(args.low_support_report, args.low_support_threshold)
+        except FileNotFoundError:
+            logging.error("Classification report not found: %s", args.low_support_report)
+            return 1
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.error("Failed to parse classification report %s: %s", args.low_support_report, exc)
+            return 1
+        logging.info(
+            "Restricting plant photo downloads to %d IDs with support < %d",
+            len(plant_photo_id_whitelist),
+            args.low_support_threshold,
+        )
+        if args.download_photos and plant_photo_id_whitelist is not None and not plant_photo_id_whitelist:
+            logging.warning("No plant IDs fell below the support threshold; skipping photo downloads.")
+
     crawler = MPDBCrawler(
         lang="en",
         delay=max(0.0, args.delay),
@@ -2821,6 +2909,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         inat_request_delay=args.inat_request_delay,
         inat_cache_ttl=args.inat_cache_ttl,
         inat_only_photos=args.inat_only_photos,
+        plant_photo_id_whitelist=plant_photo_id_whitelist,
     )
 
     results: List[CrawlResult] = []

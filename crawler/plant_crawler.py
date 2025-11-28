@@ -746,7 +746,19 @@ def crawl_plant(
 
         transformed.append(payload)
 
-        if getattr(crawler, "download_photos", False) and hasattr(crawler, "download_inaturalist_photos"):
+        allow_photo_download = True
+        checker = getattr(crawler, "_should_download_plant_photos", None)
+        if callable(checker):
+            try:
+                allow_photo_download = checker(photo_identifier)
+            except Exception:  # pragma: no cover - defensive
+                allow_photo_download = True
+
+        if (
+            getattr(crawler, "download_photos", False)
+            and allow_photo_download
+            and hasattr(crawler, "download_inaturalist_photos")
+        ):
             plant_names: List[str] = []
             for key in ("Plant latin name", "Common name", "Crude drug latin name"):
                 name_value = entry.get(key)

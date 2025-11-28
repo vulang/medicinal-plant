@@ -1,7 +1,7 @@
 from typing import Optional, Dict, Any, List, Tuple
 from PIL import Image, UnidentifiedImageError
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.data._utils.collate import default_collate
 from torchvision import datasets, transforms
 from torchvision.datasets.folder import IMG_EXTENSIONS
@@ -109,7 +109,8 @@ def build_dataloaders(
     data_cfg: Optional[Dict[str, Any]] = None,
     use_timm_augment: bool = False,
     drop_last_train: bool = False,
-    drop_last_val: bool = False
+    drop_last_val: bool = False,
+    use_weighted_sampler: bool = False
 ):
     collate = _clone_collate
     # Some classes currently have empty folders; allow_empty avoids hard failures while keeping class ordering consistent.
@@ -127,14 +128,35 @@ def build_dataloaders(
     )
 
     class_names = train_ds.classes
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=collate,
-        drop_last=drop_last_train
-    )
+    if use_weighted_sampler:
+        # Inverse-frequency weights per sample to reduce class imbalance impact
+        target_tensor = torch.tensor(train_ds.targets)
+        counts = torch.stack([(target_tensor == i).sum() for i in range(len(class_names))]).float()
+        nonzero = counts > 0
+        if not nonzero.all():
+            print("[WARN] Some classes have zero samples; they will not appear in weighted sampling.")
+        inv_freq = torch.zeros_like(counts)
+        inv_freq[nonzero] = 1.0 / counts[nonzero]
+        sample_weights = inv_freq[target_tensor]
+        sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            sampler=sampler,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate,
+            drop_last=drop_last_train
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=collate,
+            drop_last=drop_last_train
+        )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,

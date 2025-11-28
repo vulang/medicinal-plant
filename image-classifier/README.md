@@ -4,7 +4,7 @@ End-to-end project scaffold to train, evaluate, and demo a **medicinal plant spe
 
 ## 🔧 Features
 - **Folder-based dataset** (ImageNet-style): `data/train/<class>/`, `data/val/<class>/`, `data/test/<class>/`
-- **Transfer Learning** with torchvision/timm (ResNet18 by default; also ResNet50, EfficientNet-B0, MobileNetV3-Small, ConvNeXt Tiny/Small/Base/Large, ConvNeXt V2 Base `fcmae_ft_in22k_in1k`, and ViT/DeiT/Swin variants via timm)
+- **Transfer Learning** with torchvision/timm (ResNet18 by default; also ResNet50, EfficientNet-B0, MobileNetV3-Small, ConvNeXt Tiny/Small/Base/Large, ConvNeXt V2 Base `fcmae_ft_in22k_in1k`, **Swin-T / Swin-B** from torchvision, and ViT/DeiT/Swin variants via timm)
 - **Two-phase training** (head warmup + full fine-tune) with mixed-precision, LR warmup, cosine decay, label smoothing, grad clipping, and top-5 metrics.
 - **Config-driven** (`config.yaml`): image size, batch size, epochs, learning rate, model name
 - **Metrics & Confusion Matrix** saved to `outputs/`
@@ -51,7 +51,11 @@ data/
     ...
 ```
 
-> To copy photos from `crawler/photos/plants/` and split them automatically, run:
+> (Optional) First filter crawler downloads to keep plant-only images (OpenCLIP zero-shot with quality/aesthetic filters):
+> ```
+> python3 scripts/filter_non_plants.py --source ../crawler/photos/plants --destination data/filtered
+> ```
+> To split the (filtered) photos into train/val/test, run:
 > ```
 > python3 copy_and_split_data.py --clear
 > ```
@@ -86,9 +90,9 @@ streamlit run app/streamlit_app.py
 ## 🧪 Notes
 - This scaffold uses **torchvision.models** with pretrained weights and replaces the classifier head.
 - Extra backbones such as ConvNeXt V2 use **timm** under the hood; install via `pip install -r requirements.txt`.
-- Vision Transformer backbones (e.g., `vit_base_patch16_224`, `deit_base_patch16_224`, `swin_base_patch4_window7_224`) are available through `model_name`; set `img_size` to match the chosen variant (224 by default) and consider `use_timm_augment: true` for timm defaults.
+- Vision Transformer backbones (e.g., `vit_base_patch16_224`, `deit_base_patch16_224`, `swin_base_patch4_window7_224`) are available through `model_name`; set `img_size` to match the chosen variant (224 by default) and consider `use_timm_augment: true` for timm defaults. Torchvision `swin_t` / `swin_b` are also supported directly.
 - Data transforms default to the lightweight Resize/ColorJitter pipeline; set `use_timm_augment: true` in `config.yaml` if you want the more aggressive timm RandomResizedCrop recipe that matches ConvNeXt V2 pretraining.
-- Training behaviour (AMP, label smoothing, warmup epochs, patience, fine-tune LR, grad clipping) is controlled entirely from `config.yaml`.
+- Training behaviour (AMP, label smoothing or focal loss, warmup epochs, patience, fine-tune LR, grad clipping) is controlled entirely from `config.yaml`.
 - It **auto-infers class names** from the folder structure.
 - Confusion matrix and classification report are written to `outputs/`.
 - For Apple Silicon, consider installing PyTorch with the **MPS** (Metal) backend: https://pytorch.org/get-started/locally/

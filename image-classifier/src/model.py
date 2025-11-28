@@ -80,6 +80,18 @@ def build_model(model_name: str, num_classes: int, pretrained: bool = True):
         return m
     if model_name == "convnextv2_base.fcmae_ft_in22k_in1k":
         return _build_timm_model(model_name, num_classes, pretrained)
+    if model_name == "swin_t":
+        m = models.swin_t(weights=models.Swin_T_Weights.DEFAULT if pretrained else None)
+        in_feat = m.head.in_features
+        m.head = nn.Linear(in_feat, num_classes)
+        _attach_default_data_config(m, 224)
+        return m
+    if model_name == "swin_b":
+        m = models.swin_b(weights=models.Swin_B_Weights.DEFAULT if pretrained else None)
+        in_feat = m.head.in_features
+        m.head = nn.Linear(in_feat, num_classes)
+        _attach_default_data_config(m, 224)
+        return m
     if model_name.startswith(("vit_", "deit_", "swin_", "beit_")):
         return _build_timm_model(model_name, num_classes, pretrained)
     raise ValueError(f"Unknown model_name: {model_name}")

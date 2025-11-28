@@ -8,3 +8,4 @@ bin/
 lib/
 classifier-venv/
 mlruns/
+image-classifier/source/
