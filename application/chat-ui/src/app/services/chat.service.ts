@@ -9,11 +9,22 @@ export interface ClassConfidence {
   confidence: number;
 }
 
+export interface FamilyMergeClass {
+  plant_id: string;
+  plant_name: string;
+}
+
+export interface FamilyMergeInfo {
+  family_name: string;
+  classes: FamilyMergeClass[];
+}
+
 export interface PredictionResponse {
   plant_id: string;
   plant_name: string;
   confidence: number;
   class_confidences: ClassConfidence[];
+  family_merge?: FamilyMergeInfo;
 }
 
 @Injectable({ providedIn: 'root' })

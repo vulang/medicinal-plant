@@ -30,6 +30,16 @@
 
         <div *ngIf="message.prediction" class="prediction">
           <p class="prediction-title">Độ tin cậy phân loại</p>
+          <div *ngIf="message.prediction.familyMerge" class="family-merge">
+            <p class="family-title">
+              Thuộc họ {{ message.prediction.familyMerge.familyName }} (đã gộp theo họ)
+            </p>
+            <div class="family-list">
+              <span class="family-chip" *ngFor="let item of message.prediction.familyMerge.classes">
+                {{ item.plantName }} (ID: {{ item.plantId }})
+              </span>
+            </div>
+          </div>
           <div class="breakdown">
             <div class="bar" *ngFor="let item of message.prediction.breakdown">
               <div class="label">

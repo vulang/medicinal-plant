@@ -75,7 +75,7 @@
     flex-direction: row-reverse;
 
     .bubble {
-      background: linear-gradient(135deg, #2563eb, #7c3aed);
+      background: linear-gradient(135deg, #0ea5e9, #2563eb);
       border: none;
     }
 
@@ -157,6 +157,38 @@
   margin-top: 0.85rem;
   padding-top: 0.75rem;
   border-top: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.family-merge {
+  padding: 0.75rem 0.9rem;
+  margin: 0 0 0.75rem;
+  border-radius: 12px;
+  background: rgba(56, 189, 248, 0.08);
+  border: 1px solid rgba(56, 189, 248, 0.25);
+}
+
+.family-title {
+  margin: 0 0 0.5rem;
+  font-weight: 600;
+  color: #e2e8f0;
+}
+
+.family-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.family-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.35rem 0.65rem;
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.18);
+  color: #e0f2fe;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  font-size: 0.9rem;
 }
 
 .details-link {

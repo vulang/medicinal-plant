@@ -31,6 +31,7 @@ PLANT_PROMPTS = [
     "a photo of an herb plant",
     "a close-up photo of plant leaves",
     "a photo of a plant in nature",
+    "a photo of a bear", # class 148 - Ursus arctos Linné"
 ]
 NON_PLANT_PROMPTS = [
     "a photo of an animal",

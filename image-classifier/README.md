@@ -53,7 +53,7 @@ data/
 
 > (Optional) First filter crawler downloads to keep plant-only images (OpenCLIP zero-shot with quality/aesthetic filters):
 > ```
-> python3 scripts/filter_non_plants.py --source ../crawler/photos/plants --destination data/filtered
+> python3 scripts/filter_non_plants.py --source ../crawler/photos/plants --destination source
 > ```
 > To split the (filtered) photos into train/val/test, run:
 > ```

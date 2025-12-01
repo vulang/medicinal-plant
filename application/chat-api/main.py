@@ -2,6 +2,7 @@ import csv
 import io
 import os
 import logging
+import sys
 from pathlib import Path
 from typing import Dict, List
 
@@ -14,13 +15,20 @@ import torch.nn.functional as F
 from torchvision import models, transforms
 import yaml
 
+try:
+    import timm
+except ImportError:
+    timm = None
+
 
 logger = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "image-classifier"))
 DEFAULT_CONFIG_PATH = REPO_ROOT / "image-classifier" / "config.yaml"
 DEFAULT_MODELS_DIR = REPO_ROOT / "image-classifier" / "models"
 DEFAULT_PLANT_META_PATH = REPO_ROOT / "crawler" / "data" / "plant.csv"
 MIN_CUDA_COMPUTE_CAPABILITY = (5, 0)
+from merge_config import LOW_PERFORMANCE_CLASSES
 
 
 class ClassConfidence(BaseModel):
@@ -29,11 +37,22 @@ class ClassConfidence(BaseModel):
     confidence: float
 
 
+class MergedClass(BaseModel):
+    plant_id: str
+    plant_name: str
+
+
+class FamilyMergeInfo(BaseModel):
+    family_name: str
+    classes: List[MergedClass]
+
+
 class PredictionResponse(BaseModel):
     plant_id: str
     plant_name: str
     confidence: float
     class_confidences: List[ClassConfidence]
+    family_merge: FamilyMergeInfo | None = None
 
 
 def _cuda_device_supported() -> bool:
@@ -93,7 +112,15 @@ def _build_model(model_name: str, num_classes: int, pretrained: bool = False) ->
         in_features = model.classifier[3].in_features
         model.classifier[3] = torch.nn.Linear(in_features, num_classes)
         return model
-    raise ValueError(f"Unsupported model_name: {model_name}")
+    # Fallback to timm for additional architectures used during training.
+    if timm is None:
+        raise ValueError(
+            f"Unsupported model_name: {model_name}. Install timm to enable additional architectures."
+        )
+    try:
+        return timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes)
+    except Exception as exc:
+        raise ValueError(f"Unsupported model_name: {model_name}") from exc
 
 
 def _build_inference_transform(img_size: int) -> transforms.Compose:
@@ -116,6 +143,56 @@ def _load_plant_metadata(csv_path: Path) -> Dict[str, str]:
                 continue
             mapping[plant_id] = latin_name or plant_id
     return mapping
+
+
+def _load_family_lookup(csv_path: Path) -> Dict[str, str]:
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Plant metadata CSV not found at {csv_path}")
+    mapping: Dict[str, str] = {}
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            plant_id = (row.get("ID") or "").strip()
+            family_name = (row.get("Family name") or "").strip()
+            if not plant_id or not family_name:
+                continue
+            mapping[plant_id] = family_name
+    return mapping
+
+
+def _build_family_merge_lookup(
+    class_names: List[str],
+    family_lookup: Dict[str, str],
+    plant_lookup: Dict[str, str],
+) -> Dict[str, FamilyMergeInfo]:
+    """Return a map of class_id -> merged family info for merged families."""
+    from collections import defaultdict
+
+    family_groups: Dict[str, List[str]] = defaultdict(list)
+    for class_id in class_names:
+        if class_id not in LOW_PERFORMANCE_CLASSES:
+            continue
+        family_name = family_lookup.get(class_id)
+        if not family_name:
+            continue
+        family_groups[family_name].append(class_id)
+
+    merge_lookup: Dict[str, FamilyMergeInfo] = {}
+    for family_name, ids in family_groups.items():
+        if len(ids) < 2:
+            continue
+        try:
+            sorted_ids = sorted(ids, key=lambda x: int(x))
+        except ValueError:
+            sorted_ids = sorted(ids)
+        class_entries = [
+            MergedClass(plant_id=class_id, plant_name=plant_lookup.get(class_id, class_id))
+            for class_id in sorted_ids
+        ]
+        info = FamilyMergeInfo(family_name=family_name, classes=class_entries)
+        for class_id in sorted_ids:
+            merge_lookup[class_id] = info
+    return merge_lookup
 
 
 class PlantClassifierService:
@@ -148,6 +225,10 @@ class PlantClassifierService:
         self.model.eval()
         metadata_path = Path(os.getenv("PLANT_METADATA_PATH", DEFAULT_PLANT_META_PATH))
         self.plant_lookup = _load_plant_metadata(metadata_path)
+        self.family_lookup = _load_family_lookup(metadata_path)
+        self.family_merge_lookup = _build_family_merge_lookup(
+            self.class_names, self.family_lookup, self.plant_lookup
+        )
         logger.info("Loaded model '%s' on %s", self.cfg["model_name"], self.device)
 
     def _fallback_to_cpu(self) -> None:
@@ -189,11 +270,13 @@ class PlantClassifierService:
 
         plant_id = self.class_names[top_idx.item()]
         plant_name = self.plant_lookup.get(plant_id, plant_id)
+        family_merge = self.family_merge_lookup.get(plant_id)
         return PredictionResponse(
             plant_id=plant_id,
             plant_name=plant_name,
             confidence=float(top_prob),
             class_confidences=confidences,
+            family_merge=family_merge,
         )
 
 

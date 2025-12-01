@@ -140,8 +140,24 @@ export class AppComponent {
       }));
 
     message.status = 'complete';
+    const familyMerge = response.family_merge
+      ? {
+          familyName: response.family_merge.family_name,
+          classes: response.family_merge.classes.map((cls) => ({
+            plantId: cls.plant_id,
+            plantName: cls.plant_name
+          }))
+        }
+      : undefined;
     const plantLabel = `${response.plant_name} (ID: ${response.plant_id})`;
-    message.content = `Ảnh này có vẻ là ${plantLabel}.`;
+    if (familyMerge) {
+      const mergedList = familyMerge.classes
+        .map((cls) => `${cls.plantName} (ID: ${cls.plantId})`)
+        .join(', ');
+      message.content = `Ảnh này thuộc họ ${familyMerge.familyName} với các lớp đã gộp: ${mergedList}. Kết quả đại diện bởi ${plantLabel}.`;
+    } else {
+      message.content = `Ảnh này có vẻ là ${plantLabel}.`;
+    }
     message.prediction = {
       plantId: response.plant_id,
       plantName: response.plant_name,
@@ -151,7 +167,8 @@ export class AppComponent {
         plantName: entry.plant_name,
         value: entry.confidence
       })),
-      breakdown
+      breakdown,
+      familyMerge
     };
     this.messages = [...this.messages];
     this.scrollToBottom();

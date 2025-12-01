@@ -13,7 +13,7 @@ model_name: convnextv2_base.fcmae_ft_in22k_in1k   # choices: resnet18, resnet50,
 pretrained: true
 use_timm_augment: true   # set true to use timm's RandomResizedCrop-style augmentation (more aggressive)
 
-epochs: 50
+epochs: 40
 learning_rate: 0.0005
 weight_decay: 0.0001
 label_smoothing: 0.1
@@ -26,9 +26,9 @@ patience: 20
 use_amp: true
 max_grad_norm: 1.0
 finetune_lr: 0.00001        # set to a float (e.g., 0.0001) to drop LR before fine-tuning all layers
-mixup_alpha: 0.8        # >0 enables mixup
-cutmix_alpha: 1        # >0 enables cutmix
-mixup_prob: 0.8         # probability of applying mixup/cutmix to a batch
+mixup_alpha: 0       # >0 enables mixup
+cutmix_alpha: 0       # >0 enables cutmix
+mixup_prob: 0         # probability of applying mixup/cutmix to a batch
 mixup_switch_prob: 0.5   # probability of switching to the other augmentation at runtime
 mixup_mode: batch        # batch | pair | elem
 use_weighted_sampler: true  # set true to rebalance classes via WeightedRandomSampler

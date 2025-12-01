@@ -12,6 +12,10 @@ export interface ChatMessage {
     confidence: number;
     classConfidences: Array<{ plantId: string; plantName: string; value: number }>;
     breakdown: Array<{ plantId: string; plantName: string; value: number }>;
+    familyMerge?: {
+      familyName: string;
+      classes: Array<{ plantId: string; plantName: string }>;
+    };
   };
   status?: 'pending' | 'complete' | 'error';
   error?: string;
