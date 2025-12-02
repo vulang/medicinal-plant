@@ -1,0 +1,6 @@
+model_name: convnextv2_base.fcmae_ft_in22k_in1k
+img_size: 288
+device: cuda  # auto | cpu | cuda | mps
+
+allowed_origins:
+  - https://medicinal-plant-one.vercel.app

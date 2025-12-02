@@ -24,10 +24,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "image-classifier"))
-DEFAULT_CONFIG_PATH = REPO_ROOT / "image-classifier" / "config.yaml"
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
+DEFAULT_API_CONFIG_PATH = DEFAULT_CONFIG_PATH
 DEFAULT_MODELS_DIR = REPO_ROOT / "image-classifier" / "models"
 DEFAULT_PLANT_META_PATH = REPO_ROOT / "crawler" / "data" / "plant.csv"
 MIN_CUDA_COMPUTE_CAPABILITY = (5, 0)
+DEFAULT_ALLOWED_ORIGINS = ["https://medicinal-plant-one.vercel.app"]
 from merge_config import MERGE_BY_FAMILY_CLASSES
 
 
@@ -195,6 +197,36 @@ def _build_family_merge_lookup(
     return merge_lookup
 
 
+def _load_api_config(path: Path) -> Dict:
+    """Load optional API config; returns empty dict if file is missing."""
+    if not path.exists():
+        logger.info("API config not found at %s; using defaults", path)
+        return {}
+    with open(path, "r") as f:
+        return yaml.safe_load(f) or {}
+
+
+def _parse_allowed_origins(env_value: str | None, config_value) -> List[str]:
+    """Normalize allowed origins from env or config, falling back to defaults."""
+    def _normalize(origins) -> List[str]:
+        cleaned = []
+        for origin in origins:
+            if not origin:
+                continue
+            trimmed = origin.strip().rstrip("/")
+            if trimmed:
+                cleaned.append(trimmed)
+        return cleaned
+
+    if env_value:
+        return _normalize(env_value.split(","))
+    if isinstance(config_value, list):
+        return _normalize(config_value)
+    if isinstance(config_value, str):
+        return _normalize(config_value.split(","))
+    return DEFAULT_ALLOWED_ORIGINS
+
+
 class PlantClassifierService:
     def __init__(self):
         config_path = Path(os.getenv("MODEL_CONFIG_PATH", DEFAULT_CONFIG_PATH))
@@ -223,12 +255,15 @@ class PlantClassifierService:
         self.model.load_state_dict(checkpoint["model_state"])
         self.model.to(self.device)
         self.model.eval()
+        api_cfg_path = Path(os.getenv("API_CONFIG_PATH", DEFAULT_API_CONFIG_PATH))
+        self.api_cfg = _load_api_config(api_cfg_path)
         metadata_path = Path(os.getenv("PLANT_METADATA_PATH", DEFAULT_PLANT_META_PATH))
         self.plant_lookup = _load_plant_metadata(metadata_path)
         self.family_lookup = _load_family_lookup(metadata_path)
         self.family_merge_lookup = _build_family_merge_lookup(
             self.class_names, self.family_lookup, self.plant_lookup
         )
+        self.allowed_origins = _parse_allowed_origins(os.getenv("ALLOWED_ORIGINS"), self.api_cfg.get("allowed_origins"))
         logger.info("Loaded model '%s' on %s", self.cfg["model_name"], self.device)
 
     def _fallback_to_cpu(self) -> None:
@@ -284,7 +319,7 @@ classifier_service = PlantClassifierService()
 app = FastAPI(title="Medicinal Plant Chat API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("ALLOWED_ORIGINS", "*").split(","),
+    allow_origins=classifier_service.allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
