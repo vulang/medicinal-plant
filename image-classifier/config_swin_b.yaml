@@ -1,0 +1,45 @@
+# Swin-B (torchvision) fine-tuning configuration
+seed: 42
+data_dir: data
+train_dir: data/train
+val_dir: data/val
+test_dir: data/test
+
+img_size: 224
+batch_size: 16
+num_workers: 4
+
+model_name: swin_b                       # Torchvision Swin-B (ImageNet-1k pretrain)
+pretrained: true
+use_timm_augment: true   # keep stronger aug to help generalization
+
+epochs: 40
+learning_rate: 0.0003
+weight_decay: 0.05
+label_smoothing: 0.1
+loss_type: cross_entropy   # mixup enabled below, so SoftTargetCrossEntropy will be used
+focal_gamma: 2.0
+focal_alpha: null
+warmup_epochs: 6
+warmup_epochs_phase1: 3
+patience: 10
+use_amp: true
+max_grad_norm: 1.0
+finetune_lr: 0.00008
+mixup_alpha: 0.3
+cutmix_alpha: 0.0
+mixup_prob: 0.7
+mixup_switch_prob: 0.5
+mixup_mode: batch
+use_weighted_sampler: true
+
+device: cuda
+save_dir: models
+outputs_dir: outputs
+
+mlflow:
+  enabled: true
+  tracking_uri: null
+  experiment_name: medicinal-plants
+  run_name: swin-b-torchvision
+  artifact_subdir: checkpoints

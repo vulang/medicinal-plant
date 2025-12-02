@@ -65,7 +65,11 @@ MERGE_BY_FAMILY_CLASSES = {
     "192",  # Oleaceae
     "193",
     "29",   # Aristolochiaceae
-    "30"
+    "30",
+    "24",   # Amaranthaceae
+    "25",
+    "53"    # Araliaceae
+    "97"
 }
 
 # Low performance classes that should be merged by common name rather than family.

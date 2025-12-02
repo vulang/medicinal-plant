@@ -25,7 +25,16 @@ def main(cfg_path: str = "config.yaml"):
 
     device = resolve_device(cfg.get("device", "auto"))
     best_ckpt = os.path.join(cfg["save_dir"], f"{cfg['model_name']}_best.pt")
-    ckpt = torch.load(best_ckpt, map_location="cpu")
+    last_ckpt = os.path.join(cfg["save_dir"], f"{cfg['model_name']}_last.pt")
+    if os.path.exists(best_ckpt):
+        ckpt_path = best_ckpt
+    elif os.path.exists(last_ckpt):
+        ckpt_path = last_ckpt
+    else:
+        raise FileNotFoundError(f"Checkpoint not found. Tried {best_ckpt} and {last_ckpt}")
+    print(f"Loading checkpoint -> {ckpt_path}")
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
     class_names = ckpt["classes"]
     num_classes = len(class_names)
 
