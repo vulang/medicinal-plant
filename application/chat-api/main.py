@@ -28,7 +28,7 @@ DEFAULT_CONFIG_PATH = REPO_ROOT / "image-classifier" / "config.yaml"
 DEFAULT_MODELS_DIR = REPO_ROOT / "image-classifier" / "models"
 DEFAULT_PLANT_META_PATH = REPO_ROOT / "crawler" / "data" / "plant.csv"
 MIN_CUDA_COMPUTE_CAPABILITY = (5, 0)
-from merge_config import LOW_PERFORMANCE_CLASSES
+from merge_config import MERGE_BY_FAMILY_CLASSES
 
 
 class ClassConfidence(BaseModel):
@@ -170,7 +170,7 @@ def _build_family_merge_lookup(
 
     family_groups: Dict[str, List[str]] = defaultdict(list)
     for class_id in class_names:
-        if class_id not in LOW_PERFORMANCE_CLASSES:
+        if class_id not in MERGE_BY_FAMILY_CLASSES:
             continue
         family_name = family_lookup.get(class_id)
         if not family_name:

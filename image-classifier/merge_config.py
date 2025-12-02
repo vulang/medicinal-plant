@@ -4,7 +4,7 @@ Shared merge configuration for model training and serving.
 
 # Classes with low performance that should be merged by family, targeting the
 # smallest class within each family group.
-LOW_PERFORMANCE_CLASSES = {
+MERGE_BY_FAMILY_CLASSES = {
     "10",
     "11",
     "110",
@@ -20,7 +20,8 @@ LOW_PERFORMANCE_CLASSES = {
     "158",
     "177",
     "178",
-    "179",  # Rutaceae
+    "174",  # Rutaceae
+    "179", 
     "180",
     "197",
     "189",
@@ -63,6 +64,8 @@ LOW_PERFORMANCE_CLASSES = {
     "119",
     "192",  # Oleaceae
     "193",
+    "29",   # Aristolochiaceae
+    "30"
 }
 
 # Low performance classes that should be merged by common name rather than family.

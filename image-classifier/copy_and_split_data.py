@@ -22,7 +22,7 @@ from typing import Iterable
 from PIL import Image
 import yaml
 
-from merge_config import COMMON_NAME_MERGE_CLASSES, LOW_PERFORMANCE_CLASSES
+from merge_config import COMMON_NAME_MERGE_CLASSES, MERGE_BY_FAMILY_CLASSES
 
 SplitNames = ("train", "val", "test")
 # classes with too few photos should be ignored
@@ -283,7 +283,7 @@ def build_family_merge_targets(
 ) -> dict[str, str]:
     """Return a map of class -> merge target using the smallest class in each family."""
     return _build_attribute_merge_targets(
-        class_file_counts, class_families, LOW_PERFORMANCE_CLASSES
+        class_file_counts, class_families, MERGE_BY_FAMILY_CLASSES
     )
 
 
