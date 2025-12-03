@@ -16,7 +16,7 @@ from src.utils import resolve_device
 
 def main(target_class_name="25"):
     # 1. Load cấu hình
-    config_path = "config.yaml"
+    config_path = "config_vit.yaml"
     if not os.path.exists(config_path):
         print("Lỗi: Không tìm thấy file config.yaml")
         return
@@ -135,4 +135,4 @@ def main(target_class_name="25"):
         print(f"\nĐã lưu danh sách lỗi đầy đủ vào file: {csv_path}")
 
 if __name__ == "__main__":
-    main(target_class_name="97")
+    main(target_class_name="30")

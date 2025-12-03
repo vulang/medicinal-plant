@@ -1,0 +1,37 @@
+# Ensemble inference/evaluation config (Swin Base + ConvNeXt V2 Base)
+seed: 42
+data_dir: data
+train_dir: data/train
+val_dir: data/val
+test_dir: data/test
+
+img_size: 224
+batch_size: 16
+num_workers: 4
+
+# Keep a default model_name for compatibility, though the ensemble list below is used instead.
+model_name: swin_base_patch4_window7_224_in22k
+pretrained: true
+use_timm_augment: true
+
+device: cuda           # auto | cpu | cuda | mps
+save_dir: models
+outputs_dir: outputs
+
+# Swin Base + ConvNeXt V2 Base ensemble (equal weights by default).
+# Update checkpoint paths to match your trained files.
+ensemble_models:
+  - model_name: swin_base_patch4_window7_224_in22k
+    checkpoint: models/swin_base_patch4_window7_224_in22k_best.pt
+    weight: 0.5
+  - model_name: convnextv2_base.fcmae_ft_in22k_in1k
+    checkpoint: models/convnextv2_base.fcmae_ft_in22k_in1k_best.pt
+    weight: 0.5
+
+mlflow:
+  enabled: true
+  tracking_uri: null
+  experiment_name: medicinal-plants
+  run_name: swin-convnext-ensemble-eval
+  artifact_subdir: checkpoints
+  eval_artifact_subdir: eval

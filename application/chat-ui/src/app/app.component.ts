@@ -27,6 +27,21 @@ export class AppComponent {
   dragActive = false;
   isProcessing = false;
   errorMessage?: string;
+  readonly modelOptions = [
+    {
+      value: 'convnext',
+      label: 'ConvNext',
+      modelName: 'convnextv2_base.fcmae_ft_in22k_in1k',
+      description: 'ConvNeXt v2 backbone, fine-tuned for plant leaves'
+    },
+    {
+      value: 'swin_base',
+      label: 'Swin Base (Vision Transformer)',
+      modelName: 'swin_base_patch4_window7_224.ms_in22k',
+      description: 'Hierarchical ViT (Swin-B) pre-trained on ImageNet-22k'
+    }
+  ];
+  selectedModel = this.modelOptions[0].value;
 
   constructor(private chatService: ChatService) {}
 
@@ -73,11 +88,12 @@ export class AppComponent {
     const preview = this.previewUrl;
     this.selectedFile = undefined;
     this.previewUrl = undefined;
+    const modelLabel = this.getModelLabel(this.selectedModel);
 
     const userMessage: ChatMessage = {
       id: this.createId(),
       actor: 'user',
-      content: `Đã tải ảnh: ${file.name}`,
+      content: `Đã tải ảnh: ${file.name} (Mô hình: ${modelLabel})`,
       timestamp: new Date(),
       previewImageUrl: preview
     };
@@ -95,7 +111,7 @@ export class AppComponent {
 
     this.isProcessing = true;
     this.chatService
-      .predict(file)
+      .predict(file, this.selectedModel)
       .pipe(finalize(() => {
         this.isProcessing = false;
       }))
@@ -172,6 +188,10 @@ export class AppComponent {
     };
     this.messages = [...this.messages];
     this.scrollToBottom();
+  }
+
+  getModelLabel(value: string): string {
+    return this.modelOptions.find((option) => option.value === value)?.label ?? value;
   }
 
   private handlePredictionError(message: ChatMessage, error: unknown): void {

@@ -3,9 +3,18 @@
     <div>
       <h1>Tra cứu cây thuốc</h1>
     </div>
-    <div class="status-pill" [class.busy]="isProcessing">
-      <span class="dot"></span>
-      {{ isProcessing ? 'Đang phân tích ảnh...' : 'Sẵn sàng' }}
+    <div class="header-actions">
+      <label class="model-selector" for="modelSelect">
+        <select id="modelSelect" [(ngModel)]="selectedModel">
+          <option *ngFor="let option of modelOptions" [value]="option.value">
+            {{ option.label }}
+          </option>
+        </select>
+      </label>
+      <div class="status-pill" [class.busy]="isProcessing">
+        <span class="dot"></span>
+        {{ isProcessing ? 'Đang phân tích ảnh...' : 'Sẵn sàng' }}
+      </div>
     </div>
   </header>
 

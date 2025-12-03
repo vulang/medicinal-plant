@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image, UnidentifiedImageError
@@ -227,49 +227,45 @@ def _parse_allowed_origins(env_value: str | None, config_value) -> List[str]:
     return DEFAULT_ALLOWED_ORIGINS
 
 
-class PlantClassifierService:
-    def __init__(self):
-        config_path = Path(os.getenv("MODEL_CONFIG_PATH", DEFAULT_CONFIG_PATH))
-        if not config_path.exists():
-            raise FileNotFoundError(f"Config file not found at {config_path}")
-        with open(config_path, "r") as f:
-            self.cfg = yaml.safe_load(f)
-
-        checkpoint_path_env = os.getenv("MODEL_CHECKPOINT_PATH")
-        self.checkpoint_path = Path(checkpoint_path_env) if checkpoint_path_env else (
-            DEFAULT_MODELS_DIR / f"{self.cfg['model_name']}_best.pt"
-        )
+class LoadedModel:
+    def __init__(
+        self,
+        key: str,
+        model_name: str,
+        img_size: int,
+        checkpoint_path: Path,
+        device_preference: str,
+        plant_lookup: Dict[str, str],
+        family_lookup: Dict[str, str],
+    ):
+        self.key = key
+        self.model_name = model_name
+        self.checkpoint_path = checkpoint_path
         if not self.checkpoint_path.exists():
             raise FileNotFoundError(f"Checkpoint not found at {self.checkpoint_path}")
 
-        self.device = _resolve_device(os.getenv("MODEL_DEVICE", self.cfg.get("device", "auto")))
-        self.transform = _build_inference_transform(self.cfg["img_size"])
+        self.device = _resolve_device(device_preference)
+        self.transform = _build_inference_transform(img_size)
 
         checkpoint = torch.load(self.checkpoint_path, map_location=self.device)
         self.class_names: List[str] = checkpoint["classes"]
         self.model = _build_model(
-            self.cfg["model_name"],
+            self.model_name,
             num_classes=len(self.class_names),
             pretrained=False,
         )
         self.model.load_state_dict(checkpoint["model_state"])
         self.model.to(self.device)
         self.model.eval()
-        api_cfg_path = Path(os.getenv("API_CONFIG_PATH", DEFAULT_API_CONFIG_PATH))
-        self.api_cfg = _load_api_config(api_cfg_path)
-        metadata_path = Path(os.getenv("PLANT_METADATA_PATH", DEFAULT_PLANT_META_PATH))
-        self.plant_lookup = _load_plant_metadata(metadata_path)
-        self.family_lookup = _load_family_lookup(metadata_path)
+        self.plant_lookup = plant_lookup
         self.family_merge_lookup = _build_family_merge_lookup(
-            self.class_names, self.family_lookup, self.plant_lookup
+            self.class_names, family_lookup, plant_lookup
         )
-        self.allowed_origins = _parse_allowed_origins(os.getenv("ALLOWED_ORIGINS"), self.api_cfg.get("allowed_origins"))
-        logger.info("Loaded model '%s' on %s", self.cfg["model_name"], self.device)
 
     def _fallback_to_cpu(self) -> None:
         if self.device.type == "cpu":
             return
-        logger.warning("Switching inference to CPU due to CUDA execution failure.")
+        logger.warning("Switching inference for '%s' to CPU due to CUDA execution failure.", self.key)
         self.device = torch.device("cpu")
         self.model.to(self.device)
 
@@ -315,6 +311,112 @@ class PlantClassifierService:
         )
 
 
+class PlantClassifierService:
+    def __init__(self):
+        config_path = Path(os.getenv("MODEL_CONFIG_PATH", DEFAULT_CONFIG_PATH))
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found at {config_path}")
+        with open(config_path, "r") as f:
+            self.cfg = yaml.safe_load(f)
+
+        api_cfg_path = Path(os.getenv("API_CONFIG_PATH", DEFAULT_API_CONFIG_PATH))
+        self.api_cfg = _load_api_config(api_cfg_path)
+        metadata_path = Path(os.getenv("PLANT_METADATA_PATH", DEFAULT_PLANT_META_PATH))
+        self.plant_lookup = _load_plant_metadata(metadata_path)
+        self.family_lookup = _load_family_lookup(metadata_path)
+        self.model_configs = self._parse_model_configs()
+        self.default_model_key = self._resolve_default_model()
+        self.model_cache: Dict[str, LoadedModel] = {}
+        # Load default model eagerly so startup failures are explicit.
+        self._get_or_load_model(self.default_model_key)
+        self.allowed_origins = _parse_allowed_origins(os.getenv("ALLOWED_ORIGINS"), self.api_cfg.get("allowed_origins"))
+        logger.info("Loaded models: %s (default: %s)", ", ".join(self.model_configs.keys()), self.default_model_key)
+
+    def _parse_model_configs(self) -> Dict[str, Dict]:
+        model_entries = self.cfg.get("models")
+        device_default = os.getenv("MODEL_DEVICE", self.cfg.get("device", "auto"))
+        if model_entries and isinstance(model_entries, dict):
+            configs: Dict[str, Dict] = {}
+            for key, entry in model_entries.items():
+                if not isinstance(entry, dict):
+                    continue
+                model_name = entry.get("model_name")
+                img_size = entry.get("img_size")
+                if not model_name or not img_size:
+                    continue
+                checkpoint_path = entry.get("checkpoint_path")
+                configs[key] = {
+                    "model_name": model_name,
+                    "img_size": int(img_size),
+                    "device": entry.get("device", device_default),
+                    "checkpoint_path": Path(checkpoint_path) if checkpoint_path else (
+                        DEFAULT_MODELS_DIR / f"{model_name}_best.pt"
+                    ),
+                }
+            if not configs:
+                raise ValueError("No valid models defined in config.")
+            return configs
+
+        # Backward compatibility: single-model config.
+        model_name = self.cfg["model_name"]
+        img_size = self.cfg["img_size"]
+        checkpoint_path_env = os.getenv("MODEL_CHECKPOINT_PATH")
+        checkpoint_path = Path(checkpoint_path_env) if checkpoint_path_env else (
+            DEFAULT_MODELS_DIR / f"{model_name}_best.pt"
+        )
+        return {
+            model_name: {
+                "model_name": model_name,
+                "img_size": int(img_size),
+                "device": device_default,
+                "checkpoint_path": checkpoint_path,
+            }
+        }
+
+    def _resolve_default_model(self) -> str:
+        default_key = self.cfg.get("default_model")
+        if default_key and default_key in self.model_configs:
+            return default_key
+        if default_key:
+            logger.warning("Default model '%s' not found in config; using first available.", default_key)
+        # Return first defined model.
+        return next(iter(self.model_configs.keys()))
+
+    def _get_or_load_model(self, model_key: str) -> LoadedModel:
+        if model_key not in self.model_configs:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown model '{model_key}'. Available: {', '.join(self.model_configs.keys())}",
+            )
+        if model_key in self.model_cache:
+            return self.model_cache[model_key]
+        cfg = self.model_configs[model_key]
+        checkpoint_override = os.getenv("MODEL_CHECKPOINT_PATH")
+        if checkpoint_override and model_key == self.default_model_key:
+            cfg = {**cfg, "checkpoint_path": Path(checkpoint_override)}
+        try:
+            model = LoadedModel(
+                key=model_key,
+                model_name=cfg["model_name"],
+                img_size=cfg["img_size"],
+                checkpoint_path=cfg["checkpoint_path"],
+                device_preference=cfg.get("device", "auto"),
+                plant_lookup=self.plant_lookup,
+                family_lookup=self.family_lookup,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        self.model_cache[model_key] = model
+        return model
+
+    def predict(self, image_bytes: bytes, model_key: str | None = None) -> PredictionResponse:
+        key = model_key.strip() if model_key else self.default_model_key
+        model = self._get_or_load_model(key)
+        return model.predict(image_bytes)
+
+    def get_default_model(self) -> LoadedModel:
+        return self._get_or_load_model(self.default_model_key)
+
 classifier_service = PlantClassifierService()
 app = FastAPI(title="Medicinal Plant Chat API", version="0.1.0")
 app.add_middleware(
@@ -328,23 +430,29 @@ app.add_middleware(
 
 @app.get("/health")
 def health_check():
+    default_model = classifier_service.get_default_model()
     return {
         "status": "ok",
-        "model_name": classifier_service.cfg["model_name"],
-        "checkpoint": str(classifier_service.checkpoint_path),
-        "device": str(classifier_service.device),
-        "num_classes": len(classifier_service.class_names),
+        "default_model": classifier_service.default_model_key,
+        "model_name": default_model.model_name,
+        "checkpoint": str(default_model.checkpoint_path),
+        "device": str(default_model.device),
+        "available_models": list(classifier_service.model_configs.keys()),
+        "num_classes": len(default_model.class_names),
     }
 
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict(file: UploadFile = File(...)):
+async def predict(
+    file: UploadFile = File(...),
+    model: str | None = Query(None, description="Select a model by key; defaults to config.default_model"),
+):
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Uploaded file must be an image.")
     image_bytes = await file.read()
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Empty file received.")
-    return classifier_service.predict(image_bytes)
+    return classifier_service.predict(image_bytes, model_key=model)
 
 
 @app.get("/")
@@ -352,6 +460,7 @@ def root():
     return {
         "message": "Medicinal plant classifier API",
         "endpoints": ["/health", "/predict"],
+        "available_models": list(classifier_service.model_configs.keys()),
     }
 
 

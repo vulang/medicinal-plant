@@ -26,7 +26,7 @@ from merge_config import COMMON_NAME_MERGE_CLASSES, MERGE_BY_FAMILY_CLASSES
 
 SplitNames = ("train", "val", "test")
 # classes with too few photos should be ignored
-classes_to_ignore = []
+classes_to_ignore = [117, 173]
 IGNORED_CLASS_NAMES = {str(class_id) for class_id in classes_to_ignore}
 MAX_FILES_PER_CLASS = 2000
 # Map of source class -> target class for merging. Files from the source will be

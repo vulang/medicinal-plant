@@ -43,3 +43,4 @@ mlflow:
   experiment_name: medicinal-plants
   run_name: null          # optionally override per run
   artifact_subdir: checkpoints
+  eval_artifact_subdir: eval

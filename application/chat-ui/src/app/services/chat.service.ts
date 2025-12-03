@@ -33,9 +33,10 @@ export class ChatService {
 
   constructor(private http: HttpClient) {}
 
-  predict(file: File): Observable<PredictionResponse> {
+  predict(file: File, modelKey?: string): Observable<PredictionResponse> {
     const formData = new FormData();
     formData.append('file', file, file.name);
-    return this.http.post<PredictionResponse>(`${this.baseUrl}/predict`, formData);
+    const params = modelKey ? { model: modelKey } : undefined;
+    return this.http.post<PredictionResponse>(`${this.baseUrl}/predict`, formData, { params });
   }
 }
