@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
+import mlflow
+from mlflow.tracking import MlflowClient
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -197,6 +199,52 @@ def _build_family_merge_lookup(
     return merge_lookup
 
 
+def _download_mlflow_checkpoint(model_key: str, cfg: Dict, mlflow_cfg: Dict) -> Path:
+    """Download a checkpoint artifact from the MLflow Model Registry."""
+    tracking_uri = mlflow_cfg.get("tracking_uri")
+    if tracking_uri:
+        mlflow.set_tracking_uri(tracking_uri)
+
+    client = MlflowClient()
+    registered_model_name = mlflow_cfg.get("model_name") or mlflow_cfg.get("registered_model_name") or cfg["model_name"]
+    stage = mlflow_cfg.get("stage")
+    version = mlflow_cfg.get("version")
+
+    if stage:
+        versions = client.get_latest_versions(registered_model_name, stages=[stage])
+        if not versions:
+            raise HTTPException(
+                status_code=500,
+                detail=f"No versions found for model '{registered_model_name}' in stage '{stage}'.",
+            )
+        model_version = versions[0]
+    elif version:
+        model_version = client.get_model_version(registered_model_name, str(version))
+    else:
+        versions = client.get_latest_versions(registered_model_name, stages=["Production"])
+        if not versions:
+            raise HTTPException(
+                status_code=500,
+                detail=f"No Production version found for model '{registered_model_name}'. Specify mlflow.stage or mlflow.version.",
+            )
+        model_version = versions[0]
+
+    artifact_rel_path = mlflow_cfg.get("artifact_path") or f"checkpoints/{cfg['model_name']}_best.pt"
+    download_dir = DEFAULT_MODELS_DIR / "mlflow" / model_key
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        "Downloading MLflow model '%s' (version=%s, stage=%s) artifact '%s' to %s",
+        registered_model_name,
+        model_version.version,
+        model_version.current_stage,
+        artifact_rel_path,
+        download_dir,
+    )
+    local_path = client.download_artifacts(model_version.run_id, artifact_rel_path, dst_path=str(download_dir))
+    return Path(local_path)
+
+
 def _load_api_config(path: Path) -> Dict:
     """Load optional API config; returns empty dict if file is missing."""
     if not path.exists():
@@ -345,6 +393,9 @@ class PlantClassifierService:
                 if not model_name or not img_size:
                     continue
                 checkpoint_path = entry.get("checkpoint_path")
+                mlflow_cfg = entry.get("mlflow") if isinstance(entry, dict) else None
+                if mlflow_cfg and not mlflow_cfg.get("enabled", False):
+                    mlflow_cfg = None
                 configs[key] = {
                     "model_name": model_name,
                     "img_size": int(img_size),
@@ -352,6 +403,7 @@ class PlantClassifierService:
                     "checkpoint_path": Path(checkpoint_path) if checkpoint_path else (
                         DEFAULT_MODELS_DIR / f"{model_name}_best.pt"
                     ),
+                    "mlflow": mlflow_cfg if mlflow_cfg else None,
                 }
             if not configs:
                 raise ValueError("No valid models defined in config.")
@@ -361,6 +413,9 @@ class PlantClassifierService:
         model_name = self.cfg["model_name"]
         img_size = self.cfg["img_size"]
         checkpoint_path_env = os.getenv("MODEL_CHECKPOINT_PATH")
+        mlflow_cfg = self.cfg.get("mlflow")
+        if mlflow_cfg and not mlflow_cfg.get("enabled", False):
+            mlflow_cfg = None
         checkpoint_path = Path(checkpoint_path_env) if checkpoint_path_env else (
             DEFAULT_MODELS_DIR / f"{model_name}_best.pt"
         )
@@ -370,6 +425,7 @@ class PlantClassifierService:
                 "img_size": int(img_size),
                 "device": device_default,
                 "checkpoint_path": checkpoint_path,
+                "mlflow": mlflow_cfg if mlflow_cfg else None,
             }
         }
 
@@ -394,12 +450,21 @@ class PlantClassifierService:
         checkpoint_override = os.getenv("MODEL_CHECKPOINT_PATH")
         if checkpoint_override and model_key == self.default_model_key:
             cfg = {**cfg, "checkpoint_path": Path(checkpoint_override)}
+        checkpoint_path = cfg["checkpoint_path"]
+        mlflow_cfg = cfg.get("mlflow")
+        if mlflow_cfg:
+            try:
+                checkpoint_path = _download_mlflow_checkpoint(model_key, cfg, mlflow_cfg)
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.warning("Falling back to local checkpoint after MLflow download failure: %s", exc)
         try:
             model = LoadedModel(
                 key=model_key,
                 model_name=cfg["model_name"],
                 img_size=cfg["img_size"],
-                checkpoint_path=cfg["checkpoint_path"],
+                checkpoint_path=checkpoint_path,
                 device_preference=cfg.get("device", "auto"),
                 plant_lookup=self.plant_lookup,
                 family_lookup=self.family_lookup,

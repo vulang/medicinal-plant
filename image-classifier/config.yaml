@@ -36,11 +36,15 @@ use_weighted_sampler: true  # set true to rebalance classes via WeightedRandomSa
 device: cuda           # auto | cpu | cuda | mps
 save_dir: models
 outputs_dir: outputs
+resume_from: models/convnextv2_base.fcmae_ft_in22k_in1k_best.pt       # optional path to a checkpoint to resume training
 
 mlflow:
   enabled: true
-  tracking_uri: null      # e.g., http://127.0.0.1:5000 or leave null for local ./mlruns
+  tracking_uri: http://localhost:5000
   experiment_name: medicinal-plants
   run_name: null          # optionally override per run
   artifact_subdir: checkpoints
   eval_artifact_subdir: eval
+  register_model: true     # set true to push best model to MLflow Model Registry
+  registered_model_name: medicinal-plant-classifier
+  model_artifact_subdir: model

@@ -9,3 +9,5 @@ lib/
 classifier-venv/
 mlruns/
 image-classifier/source/
+image-classifier/source_original/
+image-classifier/suspect_images/

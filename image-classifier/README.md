@@ -9,6 +9,15 @@ End-to-end project scaffold to train, evaluate, and demo a **medicinal plant spe
 - **Config-driven** (`config.yaml`): image size, batch size, epochs, learning rate, model name
 - **Metrics & Confusion Matrix** saved to `outputs/`
 - **Streamlit app** for quick demo (`app/streamlit_app.py`)
+- **MLflow-ready**: log params/metrics/artifacts locally or to a remote tracking server; optional Model Registry push
+  - **Run an MLflow tracking server** backed by a database (example: Postgres + local artifacts):
+    ```
+    mlflow server \
+      --backend-store-uri postgresql+psycopg2://user:password@localhost:5432/mlflowdb \
+      --artifacts-destination /abs/path/to/mlflow-artifacts \
+      --host 0.0.0.0 --port 5000
+    ```
+    For S3/MinIO artifacts, set `MLFLOW_S3_ENDPOINT_URL` (if needed) and use `--artifacts-destination s3://my-bucket/path`. Point `mlflow.tracking_uri` in `config.yaml` to `http://<server>:5000` (already set to `http://localhost:5000`).
 
 ## 📂 Project Structure
 ```
@@ -86,6 +95,45 @@ python -m src.eval --config config.yaml
 ```
 streamlit run app/streamlit_app.py
 ```
+
+### Train an ensemble (ConvNeXt + ViT/SwinB)
+Train ConvNeXt V2 Base, ViT-B/16 (in22k), and Swin-B back-to-back and emit an ensemble config in one shot:
+```
+python -m src.train_ensemble --configs config.yaml config_vit.yaml config_swin_b.yaml \
+  --weights 0.34 0.33 0.33 --output-config config_ensemble.yaml --force
+```
+Then evaluate with the generated `config_ensemble.yaml`:
+```
+python -m src.eval --config config_ensemble.yaml
+```
+
+## 📈 MLflow Tracking (optional)
+- Enable logging by setting `mlflow.enabled: true` in `config.yaml` (default). Configs now default to `mlflow.tracking_uri: http://localhost:5000`; change this to your server URL if different.
+- Start a local UI (if using the default local store): `mlflow ui --backend-store-uri mlruns --port 5000` and open `http://127.0.0.1:5000`.
+- Training logs params, per-epoch metrics, and uploads checkpoints under `mlflow.artifact_subdir` (default `checkpoints`). Evaluation logs test metrics and confusion-matrix/report artifacts under `mlflow.eval_artifact_subdir` (default `eval`).
+- To push the best checkpoint to the MLflow Model Registry, set `mlflow.register_model: true` and choose `mlflow.registered_model_name`/`mlflow.model_artifact_subdir`.
+- Optional keys: `mlflow.experiment_name`, `mlflow.run_name`, and `mlflow.tags` let you organize runs; leave them unset to use MLflow defaults.
+
+### Docker Compose (SQLite-backed MLflow)
+`docker-compose.yaml` snippet to spin up an MLflow tracking server with SQLite (artifacts on the host):
+```yaml
+version: "3.9"
+services:
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.9.2
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/mlruns                # SQLite DB and default artifacts
+      - ./mlartifacts:/mlartifacts      # Artifact root (optional separate path)
+    command: >
+      mlflow server
+        --backend-store-uri sqlite:///mlruns/mlflow.db
+        --artifacts-destination /mlartifacts
+        --host 0.0.0.0
+        --port 5000
+```
+Start it with `docker compose up -d mlflow`; `config.yaml` already points `mlflow.tracking_uri` to `http://localhost:5000`.
 
 ## 🧪 Notes
 - This scaffold uses **torchvision.models** with pretrained weights and replaces the classifier head.

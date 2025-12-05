@@ -1,4 +1,5 @@
 import os
+import copy
 import yaml
 from tqdm import tqdm
 import torch
@@ -9,6 +10,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch import amp
 from sklearn.metrics import f1_score
 import mlflow
+import mlflow.pytorch
 
 try:
     from timm.data import Mixup
@@ -180,6 +182,10 @@ def main(cfg_path: str = "config.yaml"):
     with open(cfg_path, "r") as f:
         cfg = yaml.safe_load(f)
 
+    resume_from = cfg.get("resume_from")
+    if resume_from:
+        resume_from = os.path.expanduser(resume_from)
+
     set_seed(cfg.get("seed", 42))
     device = resolve_device(cfg.get("device", "auto"))
     os.makedirs(cfg["save_dir"], exist_ok=True)
@@ -188,6 +194,9 @@ def main(cfg_path: str = "config.yaml"):
     mlflow_cfg = cfg.get("mlflow") or {}
     mlflow_enabled = mlflow_cfg.get("enabled", False)
     artifact_subdir = mlflow_cfg.get("artifact_subdir") or "checkpoints"
+    register_model = mlflow_cfg.get("register_model", False)
+    registered_model_name = mlflow_cfg.get("registered_model_name")
+    model_artifact_subdir = mlflow_cfg.get("model_artifact_subdir") or "model"
     mlflow_run = None
     if mlflow_enabled:
         tracking_uri = mlflow_cfg.get("tracking_uri")
@@ -290,16 +299,57 @@ def main(cfg_path: str = "config.yaml"):
     else:
         scheduler = CosineAnnealingLR(optimizer, T_max=max(total_epochs, 1))
 
+    finetune_lr = cfg.get("finetune_lr")
     use_amp = cfg.get("use_amp", True) and device.type == "cuda"
     max_grad_norm = cfg.get("max_grad_norm", 1.0)
     warmup_phase1_epochs = cfg.get("warmup_epochs_phase1", 0)
     patience = cfg.get("patience", 10)
+    best_ckpt_interval = max(1, int(cfg.get("best_checkpoint_interval", 10)))
 
     best_val_acc = 0.0
     best_val_top5 = 0.0
     best_val_f1 = 0.0
     patience_counter = 0
     best_ckpt = os.path.join(cfg["save_dir"], f"{cfg['model_name']}_best.pt")
+
+    resume_checkpoint = None
+    resume_epoch = 0
+    completed_phase1 = 0
+    completed_phase2 = 0
+    if resume_from:
+        if not os.path.isfile(resume_from):
+            raise FileNotFoundError(f"Resume checkpoint not found at {resume_from}")
+        print(f"[INFO] Loading checkpoint from {resume_from}")
+        resume_checkpoint = torch.load(resume_from, map_location=device)
+        model.load_state_dict(resume_checkpoint["model_state"])
+        if "optimizer_state" in resume_checkpoint:
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state"])
+        scheduler_loaded = False
+        if "scheduler_state" in resume_checkpoint:
+            try:
+                scheduler.load_state_dict(resume_checkpoint["scheduler_state"])
+                scheduler_loaded = True
+            except Exception as e:
+                if finetune_lr:
+                    try:
+                        scheduler = CosineAnnealingLR(optimizer, T_max=max(total_epochs, 1))
+                        scheduler.load_state_dict(resume_checkpoint["scheduler_state"])
+                        scheduler_loaded = True
+                        print("[INFO] Recreated cosine scheduler for fine-tuning resume.")
+                    except Exception as inner_exc:
+                        print(f"[WARN] Could not load scheduler state even after rebuild: {inner_exc}")
+                if not scheduler_loaded:
+                    print(f"[WARN] Could not load scheduler state from checkpoint: {e}")
+        resume_epoch = int(resume_checkpoint.get("epoch", 0))
+        best_val_acc = resume_checkpoint.get("best_val_acc", 0.0)
+        best_val_top5 = resume_checkpoint.get("best_val_top5", 0.0)
+        best_val_f1 = resume_checkpoint.get("best_val_f1", 0.0)
+        patience_counter = resume_checkpoint.get("patience_counter", 0)
+        ckpt_classes = resume_checkpoint.get("classes")
+        if ckpt_classes and ckpt_classes != class_names:
+            print("[WARN] Class order in checkpoint differs from current dataloader order.")
+        completed_phase1 = min(resume_epoch, warmup_phase1_epochs)
+        completed_phase2 = max(resume_epoch - warmup_phase1_epochs, 0)
 
     print("=" * 70)
     print("Training Configuration")
@@ -313,25 +363,69 @@ def main(cfg_path: str = "config.yaml"):
     print(f"  Weight Decay: {cfg.get('weight_decay', 0.01)}")
     print(f"  Label Smoothing: {cfg.get('label_smoothing', 0.0)}")
     print(f"  Early stop patience: {patience}")
+    print(f"  Best checkpoint interval: {best_ckpt_interval} epochs")
+    if resume_from:
+        print(f"  Resume from: {resume_from} (epoch {resume_epoch})")
     if mixup_active:
         print(f"  Mixup/CutMix: mixup_alpha={mixup_alpha}, cutmix_alpha={cutmix_alpha}, prob={mixup_prob}, "
               f"switch_prob={mixup_switch_prob}, mode={mixup_mode}")
     print("=" * 70)
 
-    global_epoch = 0
+    total_planned_epochs = warmup_phase1_epochs + total_epochs
+    if resume_epoch >= total_planned_epochs:
+        print(f"[INFO] Checkpoint epoch {resume_epoch} meets or exceeds configured total ({total_planned_epochs}). Nothing to train.")
+        return
+
+    global_epoch = resume_epoch
 
     def log_epoch_metrics(step, metrics):
         if mlflow_enabled:
             mlflow.log_metrics(metrics, step=step)
 
+    best_state = None
+    best_state_pending = False
+
+    def stage_best_checkpoint(epoch, val_metrics):
+        """Capture the current best state so it can be saved on interval."""
+        nonlocal best_state, best_state_pending
+        best_state = {
+            "epoch": epoch,
+            "model_state": copy.deepcopy(model.state_dict()),
+            "optimizer_state": copy.deepcopy(optimizer.state_dict()),
+            "best_val_acc": val_metrics["val_acc"],
+            "best_val_top5": val_metrics["val_top5"],
+            "best_val_f1": val_metrics["val_f1"],
+            "patience_counter": 0,
+            "scheduler_state": copy.deepcopy(scheduler.state_dict()),
+            "classes": class_names,
+            "config": cfg
+        }
+        best_state_pending = True
+
+    def maybe_save_best(force: bool = False):
+        """Persist staged best checkpoint based on interval or when forced."""
+        nonlocal best_state_pending
+        if best_state is None:
+            return
+        if not force and not best_state_pending:
+            return
+        if not force and (global_epoch % best_ckpt_interval != 0):
+            return
+        torch.save(best_state, best_ckpt)
+        best_state_pending = False
+        print(f"  → Saved new best model (Val Acc {best_state['best_val_acc']:.4f}, "
+              f"Top5 {best_state['best_val_top5']:.4f}, F1 {best_state['best_val_f1']:.4f})")
+        if mlflow_enabled:
+            mlflow.log_artifact(best_ckpt, artifact_path=artifact_subdir)
+
     # Phase 1: train classifier head only
-    if warmup_phase1_epochs > 0:
+    if warmup_phase1_epochs > completed_phase1:
         print("\n" + "*" * 70)
-        print(f"PHASE 1: Training classifier head for {warmup_phase1_epochs} epochs")
+        print(f"PHASE 1: Training classifier head for {warmup_phase1_epochs} epochs (starting at {completed_phase1 + 1})")
         print("*" * 70)
         freeze_layers(model, freeze=True)
 
-        for epoch in range(1, warmup_phase1_epochs + 1):
+        for epoch in range(completed_phase1 + 1, warmup_phase1_epochs + 1):
             train_loss, train_acc, train_top5 = train_one_epoch(
                 model, train_loader, train_criterion, optimizer, device, use_amp, max_grad_norm, mixup_fn
             )
@@ -360,20 +454,28 @@ def main(cfg_path: str = "config.yaml"):
             })
             global_epoch += 1
 
+    elif warmup_phase1_epochs > 0:
+        print("\n" + "*" * 70)
+        print(f"PHASE 1: Skipping (already completed {completed_phase1} / {warmup_phase1_epochs} epochs in checkpoint)")
+        print("*" * 70)
+
     # Phase 2: fine-tune entire network
     print("\n" + "*" * 70)
     print("PHASE 2: Fine-tuning all layers")
+    print(f"Starting at epoch {completed_phase2 + 1}/{total_epochs}")
     print("*" * 70)
     freeze_layers(model, freeze=False)
 
-    finetune_lr = cfg.get("finetune_lr")
-    if finetune_lr:
+    apply_finetune_lr = finetune_lr and (resume_checkpoint is None or resume_epoch < warmup_phase1_epochs)
+    if apply_finetune_lr:
         for param_group in optimizer.param_groups:
             param_group["lr"] = finetune_lr
         scheduler = CosineAnnealingLR(optimizer, T_max=total_epochs)
         print(f"Reduced LR to {finetune_lr:.2e} for fine-tuning.")
+    elif finetune_lr and resume_checkpoint is not None:
+        print(f"Keeping optimizer LR from checkpoint (fine-tune LR already applied in {resume_from}).")
 
-    for epoch in range(1, total_epochs + 1):
+    for epoch in range(completed_phase2 + 1, total_epochs + 1):
         train_loss, train_acc, train_top5 = train_one_epoch(
             model, train_loader, train_criterion, optimizer, device, use_amp, max_grad_norm, mixup_fn
         )
@@ -396,46 +498,50 @@ def main(cfg_path: str = "config.yaml"):
             "learning_rate": lr,
         })
         global_epoch += 1
+        current_epoch_total = global_epoch
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_val_top5 = val_top5
             best_val_f1 = val_f1
             patience_counter = 0
-            torch.save({
-                "epoch": warmup_phase1_epochs + epoch,
-                "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "best_val_acc": best_val_acc,
-                "best_val_top5": best_val_top5,
-                "best_val_f1": best_val_f1,
-                "classes": class_names,
-                "config": cfg
-            }, best_ckpt)
-            print(f"  → Saved new best model (Val Acc {best_val_acc:.4f}, Top5 {best_val_top5:.4f}, F1 {best_val_f1:.4f})")
+            stage_best_checkpoint(current_epoch_total, {
+                "val_acc": best_val_acc,
+                "val_top5": best_val_top5,
+                "val_f1": best_val_f1,
+            })
+            maybe_save_best()
             if mlflow_enabled:
                 mlflow.log_metrics({
                     "best_val_acc": best_val_acc,
                     "best_val_top5": best_val_top5,
                     "best_val_f1": best_val_f1,
                 }, step=global_epoch)
-                mlflow.log_artifact(best_ckpt, artifact_path=artifact_subdir)
         else:
             patience_counter += 1
             if patience_counter >= patience:
+                maybe_save_best(force=True)
                 print("=" * 70)
-                print(f"Early stopping triggered after {warmup_phase1_epochs + epoch} total epochs.")
+                print(f"Early stopping triggered after {global_epoch} total epochs.")
                 print("=" * 70)
                 break
+        maybe_save_best()
+
+    maybe_save_best(force=True)
 
     last_ckpt = os.path.join(cfg["save_dir"], f"{cfg['model_name']}_last.pt")
     torch.save({
-        "epoch": warmup_phase1_epochs + epoch,
+        "epoch": global_epoch,
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "val_acc": val_acc,
         "val_top5": val_top5,
         "val_f1": val_f1,
+        "best_val_acc": best_val_acc,
+        "best_val_top5": best_val_top5,
+        "best_val_f1": best_val_f1,
+        "patience_counter": patience_counter,
+        "scheduler_state": scheduler.state_dict(),
         "classes": class_names,
         "config": cfg
     }, last_ckpt)
@@ -452,6 +558,36 @@ def main(cfg_path: str = "config.yaml"):
     print("=" * 70)
 
     if mlflow_enabled:
+        if register_model and registered_model_name:
+            try:
+                ckpt_to_register = best_ckpt if os.path.exists(best_ckpt) else last_ckpt
+                reg_ckpt = torch.load(ckpt_to_register, map_location="cpu")
+                reg_model = build_model(cfg["model_name"], len(reg_ckpt["classes"]), pretrained=False)
+                reg_model.load_state_dict(reg_ckpt["model_state"])
+                reg_model.eval()
+
+                # Log the model artifact first
+                mlflow.pytorch.log_model(
+                    reg_model,
+                    artifact_path=model_artifact_subdir,
+                )
+                artifact_uri = mlflow.get_artifact_uri(model_artifact_subdir)
+
+                # Try to register the logged artifact
+                try:
+                    mlflow.register_model(model_uri=artifact_uri, name=registered_model_name)
+                    print(f"Registered model to MLflow Model Registry as '{registered_model_name}'.")
+                except Exception as reg_exc:
+                    msg = str(reg_exc)
+                    if "logged-models" in msg or "404" in msg:
+                        print("[WARN] MLflow server does not expose the Model Registry endpoints (logged-models). "
+                              "Model artifacts were logged but not registered. "
+                              "Upgrade/enable the MLflow Model Registry or set mlflow.register_model=false.")
+                    else:
+                        print(f"[WARN] Failed to register model to MLflow: {reg_exc}")
+            except Exception as e:
+                print(f"[WARN] Failed to log/register model to MLflow: {e}")
+
         mlflow.log_metrics({
             "final_val_acc": val_acc,
             "final_val_top5": val_top5,

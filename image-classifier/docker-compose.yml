@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  mlflow:
+    # Update the image to a newer version (v3.6.0 or latest) to match your client
+    image: ghcr.io/mlflow/mlflow:v3.6.0
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/mlruns
+      - ./mlartifacts:/mlartifacts
+    command: >
+      mlflow server
+        --backend-store-uri sqlite:///mlruns/mlflow.db
+        --default-artifact-root /mlartifacts
+        --host 0.0.0.0
+        --port 5000
+    restart: unless-stopped

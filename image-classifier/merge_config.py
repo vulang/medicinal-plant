@@ -21,6 +21,7 @@ MERGE_BY_FAMILY_CLASSES = {
     "177",
     "178",
     "174",  # Rutaceae
+    "175",
     "179", 
     "180",
     "197",
@@ -38,6 +39,7 @@ MERGE_BY_FAMILY_CLASSES = {
     "55",
     "170",
     "28",
+    "84",  # Papaveraceae
     "85",
     "86",
     "87",
@@ -68,8 +70,33 @@ MERGE_BY_FAMILY_CLASSES = {
     "30",
     "24",   # Amaranthaceae
     "25",
-    "53"    # Araliaceae
-    "97"
+    "53",   # Araliaceae
+    "97",
+    "44",   # Polygalaceae
+    "152",
+    "155",  # Compositae
+    "156",
+    "80",
+    "159",  # Rosaceae
+    "163",
+    "164",
+    "188",
+    "189",
+    "194",  # Ranunculaceae
+    "195",
+    "196",
+    "77",
+    "78",
+    "37",   # Scrophulariaceae
+    "38",
+    "45",   # Umbelliferae
+    "166",
+    "35",   # Dioscoreaceae
+    "36",
+    "40",   # Paeoniaceae
+    "60",
+    "74",   # Zingiberaceae
+    "200"
 }
 
 # Low performance classes that should be merged by common name rather than family.
