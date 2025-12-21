@@ -8,6 +8,9 @@ bin/
 lib/
 classifier-venv/
 mlruns/
+**/logs/
 image-classifier/source/
 image-classifier/source_original/
 image-classifier/suspect_images/
+image-classifier/source-with-parts/
+image-classifier/image-classifier/data/removed-by-preprocessed

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import math
 import random
 import shutil
@@ -29,6 +30,7 @@ SplitNames = ("train", "val", "test")
 classes_to_ignore = [117, 173]
 IGNORED_CLASS_NAMES = {str(class_id) for class_id in classes_to_ignore}
 MAX_FILES_PER_CLASS = 2000
+SMALL_CLASS_MERGE_THRESHOLD = 200
 # Map of source class -> target class for merging. Files from the source will be
 # merged into the target; duplicates (by filename) are skipped.
 CLASS_MERGE_TARGETS = {
@@ -39,7 +41,7 @@ CLASS_MERGE_TARGETS = {
 }
 # Metadata used to resolve family names.
 PLANT_METADATA_PATH = (
-    Path(__file__).resolve().parent.parent / "crawler" / "data" / "plant.csv"
+    Path(__file__).resolve().parent.parent / "crawler" / "data" / "plants.csv"
 )
 
 
@@ -92,6 +94,28 @@ def parse_args() -> argparse.Namespace:
         "--clear",
         action="store_true",
         help="Remove the destination directory before copying to ensure a clean split.",
+    )
+    parser.add_argument(
+        "--no-merge",
+        action="store_true",
+        help=(
+            "Disable dynamic class merging (family/common-name); fixed CLASS_MERGE_TARGETS still apply. "
+            "Classes below the small-class threshold may still merge by family metadata."
+        ),
+    )
+    parser.add_argument(
+        "--delete-duplicates",
+        action="store_true",
+        help=(
+            "Skip copying duplicates to the destination (by name, and also by content hash); "
+            "source files remain intact."
+        ),
+    )
+    parser.add_argument(
+        "--dedupe-scope",
+        choices=["class", "global"],
+        default="global",
+        help="Scope for duplicate detection when --delete-duplicates is used (default: global).",
     )
     return parser.parse_args()
 
@@ -253,11 +277,12 @@ def load_class_common_names(metadata_path: Path) -> dict[str, str]:
 def _build_attribute_merge_targets(
     class_file_counts: dict[str, int],
     class_attributes: dict[str, str],
-    target_classes: Iterable[str],
+    target_classes: Iterable[str] | None,
 ) -> dict[str, str]:
     """Return a map of class -> merge target using the smallest class per attribute."""
     attribute_groups: defaultdict[str, list[str]] = defaultdict(list)
-    for class_name in target_classes:
+    effective_targets = target_classes or class_attributes.keys()
+    for class_name in effective_targets:
         if class_name not in class_file_counts:
             continue
         attribute_value = class_attributes.get(class_name)
@@ -279,12 +304,13 @@ def _build_attribute_merge_targets(
 
 
 def build_family_merge_targets(
-    class_file_counts: dict[str, int], class_families: dict[str, str]
+    class_file_counts: dict[str, int],
+    class_families: dict[str, str],
+    target_classes: Iterable[str] | None = None,
 ) -> dict[str, str]:
     """Return a map of class -> merge target using the smallest class in each family."""
-    return _build_attribute_merge_targets(
-        class_file_counts, class_families, MERGE_BY_FAMILY_CLASSES
-    )
+    targets = MERGE_BY_FAMILY_CLASSES if target_classes is None else target_classes
+    return _build_attribute_merge_targets(class_file_counts, class_families, targets)
 
 
 def build_common_name_merge_targets(
@@ -294,6 +320,14 @@ def build_common_name_merge_targets(
     return _build_attribute_merge_targets(
         class_file_counts, class_common_names, COMMON_NAME_MERGE_CLASSES
     )
+
+
+def compute_file_hash(file_path: Path, chunk_size: int = 8192) -> str:
+    hasher = hashlib.sha256()
+    with file_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def main() -> None:
@@ -308,7 +342,10 @@ def main() -> None:
     common_name_merge_targets = build_common_name_merge_targets(
         class_file_counts, class_common_names
     )
-    merge_targets = {**family_merge_targets, **common_name_merge_targets}
+    merge_targets: dict[str, str] = {**family_merge_targets, **common_name_merge_targets}
+    fallback_family_merge_targets = build_family_merge_targets(
+        class_file_counts, class_families, target_classes=class_families.keys()
+    )
 
     safe_makedirs(args.destination, args.clear, args.source)
     random.seed(args.seed)
@@ -321,7 +358,9 @@ def main() -> None:
     # Accumulate files per target class after merge handling.
     merged_files: dict[str, list[Path]] = {}
     merged_seen_names: dict[str, set[str]] = {}
+    merged_seen_hashes: dict[str, set[str]] = {}
     duplicates_skipped: dict[str, int] = {}
+    global_seen_hashes: set[str] | None = set() if args.delete_duplicates and args.dedupe_scope == "global" else None
 
     for class_dir in class_dirs:
         files = [path for path in class_dir.iterdir() if path.is_file()]
@@ -331,20 +370,46 @@ def main() -> None:
             print(f"Skipping {class_dir.name}: listed in classes_to_ignore.")
             continue
         filtered_files, skipped_small = filter_small_images(files, img_size)
+        filtered_count = len(filtered_files)
         if skipped_small:
             print(f"{class_dir.name}: filtered out {skipped_small} files smaller than {img_size}px.")
-        target_class = merge_targets.get(
-            class_dir.name, CLASS_MERGE_TARGETS.get(class_dir.name, class_dir.name)
-        )
+        base_target = CLASS_MERGE_TARGETS.get(class_dir.name, class_dir.name)
+        if not args.no_merge:
+            target_class = merge_targets.get(base_target, base_target)
+        elif filtered_count < SMALL_CLASS_MERGE_THRESHOLD:
+            target_class = fallback_family_merge_targets.get(base_target, base_target)
+        else:
+            target_class = base_target
         target_list = merged_files.setdefault(target_class, [])
         seen_names = merged_seen_names.setdefault(target_class, set())
+        if args.delete_duplicates:
+            if args.dedupe_scope == "global" and global_seen_hashes is not None:
+                seen_hashes = global_seen_hashes
+            else:
+                seen_hashes = merged_seen_hashes.setdefault(target_class, set())
+        else:
+            seen_hashes = None
 
         duplicates = 0
         for file_path in filtered_files:
+            duplicate = False
             if file_path.name in seen_names:
+                duplicate = True
+            file_hash: str | None = None
+            if not duplicate and args.delete_duplicates:
+                try:
+                    file_hash = compute_file_hash(file_path)
+                except OSError as exc:
+                    print(f"Warning: could not hash '{file_path}': {exc}")
+                    continue
+                if file_hash in (seen_hashes or set()):
+                    duplicate = True
+            if duplicate:
                 duplicates += 1
                 continue
             seen_names.add(file_path.name)
+            if args.delete_duplicates and file_hash is not None and seen_hashes is not None:
+                seen_hashes.add(file_hash)
             target_list.append(file_path)
         duplicates_skipped[target_class] = duplicates_skipped.get(target_class, 0) + duplicates
 

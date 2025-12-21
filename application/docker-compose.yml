@@ -1,0 +1,10 @@
+version: "3.9"
+
+services:
+  chat-api:
+    build:
+      context: ../
+      dockerfile: application/chat-api/Dockerfile
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

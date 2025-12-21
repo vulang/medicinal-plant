@@ -8,7 +8,8 @@ MERGE_BY_FAMILY_CLASSES = {
     "10",
     "11",
     "110",
-    "112",  # Magnoliaceae
+    "94",   # Magnoliaceae
+    "112",  
     "113",
     "114",
     "115",
@@ -56,7 +57,8 @@ MERGE_BY_FAMILY_CLASSES = {
     "134",
     "135",
     "136",
-    "137",  # Gentianaceae
+    "21",   # Gentianaceae
+    "137",  
     "138",
     "167",  # Bufonidae
     "168",
@@ -96,7 +98,11 @@ MERGE_BY_FAMILY_CLASSES = {
     "40",   # Paeoniaceae
     "60",
     "74",   # Zingiberaceae
-    "200"
+    "200",
+    "3",    # Compositae
+    "101",
+    "154"
+
 }
 
 # Low performance classes that should be merged by common name rather than family.

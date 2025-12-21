@@ -29,7 +29,7 @@ sys.path.insert(0, str(REPO_ROOT / "image-classifier"))
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
 DEFAULT_API_CONFIG_PATH = DEFAULT_CONFIG_PATH
 DEFAULT_MODELS_DIR = REPO_ROOT / "image-classifier" / "models"
-DEFAULT_PLANT_META_PATH = REPO_ROOT / "crawler" / "data" / "plant.csv"
+DEFAULT_PLANT_META_PATH = REPO_ROOT / "crawler" / "data" / "plants.csv"
 MIN_CUDA_COMPUTE_CAPABILITY = (5, 0)
 DEFAULT_ALLOWED_ORIGINS = ["https://medicinal-plant-one.vercel.app"]
 from merge_config import MERGE_BY_FAMILY_CLASSES

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import argparse
+import csv
 import logging
+import re
+import sys
 import time
 import urllib.parse
 import warnings
@@ -21,6 +25,11 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "http://mpdb.nibiohn.go.jp"
 PLANT_LIST_URL = f"{BASE_URL}/mpdb-bin/list_data.cgi?category=plant"
+
+INAT_API_BASE = "https://api.inaturalist.org/v1"
+INAT_OBSERVATIONS_ENDPOINT = f"{INAT_API_BASE}/observations"
+INAT_DEFAULT_MAX_PHOTOS = 50
+INAT_DEFAULT_REQUEST_DELAY = 1.0
 
 EXPECTED_COLUMNS: List[str] = [
     "ID",
@@ -210,7 +219,51 @@ def _parse_html(content: bytes) -> BeautifulSoup:
     raise FeatureNotFound("No supported HTML parser (lxml or html.parser) is available.")
 
 
-def fetch_plant_detail(url: str, session: Optional[requests.Session] = None) -> Dict[str, str]:
+def fetch_photo_library(photo_page_url: str, session: Optional[requests.Session] = None) -> List[Dict[str, Optional[str]]]:
+    """Fetch photo metadata from the dedicated MPDB plant photo library page."""
+    sess = session or _create_session()
+    logger.debug("Fetching plant photo library page: %s", photo_page_url)
+    resp = sess.get(photo_page_url, timeout=30)
+    resp.raise_for_status()
+
+    soup = _parse_html(resp.content)
+    photo_main = soup.find("table", class_="photo_main")
+    if photo_main is None:
+        return []
+
+    photos: List[Dict[str, Optional[str]]] = []
+    for photo_table in photo_main.find_all("table", class_="photo"):
+        anchor = photo_table.find("a", href=True)
+        full_url = _absolute_url(anchor["href"]) if anchor else None
+        img_tag = photo_table.find("img", src=True)
+        thumb_url = _absolute_url(img_tag["src"]) if img_tag else None
+
+        text_lines: List[str] = []
+        for tr in photo_table.find_all("tr")[1:]:
+            text = _text_or_empty(tr)
+            if text:
+                text_lines.append(text)
+
+        file_name = text_lines[0] if text_lines else None
+        extra_text = text_lines[1:] if len(text_lines) > 1 else None
+
+        photos.append(
+            {
+                "full_size_url": full_url,
+                "thumbnail_url": thumb_url,
+                "file_name": file_name,
+                "notes": extra_text,
+            }
+        )
+
+    return photos
+
+
+def fetch_plant_detail(
+    url: str,
+    session: Optional[requests.Session] = None,
+    include_photos: bool = False,
+) -> Dict[str, str]:
     sess = session or _create_session()
     logger.debug("Fetching plant detail page: %s", url)
     resp = sess.get(url, timeout=30)
@@ -249,6 +302,7 @@ def fetch_plant_detail(url: str, session: Optional[requests.Session] = None) -> 
 
     tissue_links: List[Dict[str, str]] = []
     cultivation_links: List[Dict[str, str]] = []
+    photo_entries: List[Dict[str, Optional[str]]] = []
 
     for tr in detail_table.find_all("tr", recursive=False):
         tds = tr.find_all("td", recursive=False)
@@ -256,9 +310,30 @@ def fetch_plant_detail(url: str, session: Optional[requests.Session] = None) -> 
             continue
         raw_label = _text_or_empty(tds[0])
         normalized_label = " ".join(raw_label.split()).lower()
+        value_cell = tds[1] if len(tds) >= 2 else None
+
+        if include_photos and value_cell is not None:
+            inline_photos = _extract_photo_entries(value_cell)
+            if inline_photos:
+                photo_entries.extend(inline_photos)
+
+        if include_photos and normalized_label == "photo library" and value_cell is not None:
+            library_links = _extract_links(value_cell)
+            for link_info in library_links:
+                detail_url = link_info.get("url")
+                if not detail_url:
+                    continue
+                try:
+                    photo_entries.extend(fetch_photo_library(detail_url, session=sess))
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning("Failed to fetch photo library %s: %s", detail_url, exc)
+            data[_normalise_text(raw_label)] = ", ".join(
+                filter(None, (_normalise_text(link.get("text") or "") for link in library_links))
+            )
+            continue
+
         if normalized_label in mapping and len(tds) >= 2:
             key = mapping[normalized_label]
-            value_cell = tds[1]
             extracted_links = _extract_links(value_cell)
             if extracted_links:
                 if normalized_label == "cultured tissue and efficient propagation":
@@ -296,6 +371,10 @@ def fetch_plant_detail(url: str, session: Optional[requests.Session] = None) -> 
         data["_tissue_culture_links"] = tissue_links
     if cultivation_links:
         data["_cultivation_links"] = cultivation_links
+    if include_photos and photo_entries:
+        data["_photos"] = photo_entries
+
+    data["_detail_url"] = url
 
     return data
 
@@ -464,6 +543,7 @@ def crawl_plants(
     limit: Optional[int] = None,
     delay_seconds: float = 0.5,
     session: Optional[requests.Session] = None,
+    include_photos: bool = False,
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]:
     session = session or _create_session()
     plant_results: List[Dict[str, str]] = []
@@ -473,7 +553,7 @@ def crawl_plants(
     count = 0
     for url in iter_plant_entry_urls(session=session):
         try:
-            data = fetch_plant_detail(url, session=session)
+            data = fetch_plant_detail(url, session=session, include_photos=include_photos)
             if data:
                 tissue_links = data.pop("_tissue_culture_links", [])
                 cultivation_links = data.pop("_cultivation_links", [])
@@ -816,3 +896,347 @@ def crawl_cultivation(
         for identifier, photos in downloads:
             crawler._download_photos_for_category("cultivation", identifier, photos)
     return items, headers
+
+
+# Standalone helpers ---------------------------------------------------------------------------
+
+
+def _slugify_identifier(value: str) -> str:
+    cleaned = _normalise_text(value)
+    cleaned = re.sub(r"[^\w]+", "_", cleaned).strip("_")
+    return cleaned or "plant"
+
+
+def _derive_photo_identifier(entry: Dict[str, Any]) -> str:
+    for key in ("ID", "Plant latin name", "Common name", "Crude drug latin name"):
+        text_value = _value_to_string(entry.get(key))
+        if text_value:
+            return _slugify_identifier(text_value)
+    return "plant"
+
+
+def _write_plants_csv(output_path: Path, entries: List[Dict[str, str]]) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=EXPECTED_COLUMNS)
+        writer.writeheader()
+        for entry in entries:
+            row = {column: _value_to_string(entry.get(column)) or "" for column in EXPECTED_COLUMNS}
+            writer.writerow(row)
+
+
+def _download_photo_entries(
+    photos: List[Dict[str, Optional[str]]],
+    target_dir: Path,
+    *,
+    session: Optional[requests.Session] = None,
+) -> int:
+    """Download photo assets into a directory, returning the count saved."""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    sess = session or _create_session()
+    downloaded = 0
+    for idx, entry in enumerate(photos):
+        url = entry.get("full_size_url") or entry.get("thumbnail_url")
+        if not url:
+            continue
+        file_name = entry.get("file_name") or Path(urllib.parse.urlparse(url).path).name
+        if not file_name:
+            file_name = f"photo_{idx + 1}.jpg"
+        destination = target_dir / file_name
+        if destination.exists():
+            continue
+        try:
+            logger.info("Downloading photo from %s -> %s", url, destination)
+            response = sess.get(url, timeout=30)
+            response.raise_for_status()
+            destination.write_bytes(response.content)
+            downloaded += 1
+        except Exception as exc:  # pragma: no cover - defensive against transient HTTP failures
+            logger.warning("Failed to download %s: %s", url, exc)
+            continue
+    return downloaded
+
+
+def _download_mpdb_photos(
+    entries: List[Dict[str, Any]],
+    target_root: Path,
+    *,
+    session: Optional[requests.Session] = None,
+) -> None:
+    """Download MPDB-hosted photos for plant entries when available."""
+    sess = session or _create_session()
+    total_downloaded = 0
+    for entry in entries:
+        identifier = _derive_photo_identifier(entry)
+        photos = entry.get("_photos") or []
+        if not photos:
+            detail_url = entry.get("_detail_url")
+            if detail_url:
+                logger.info("Refreshing plant detail for %s to look for MPDB photos", identifier)
+                try:
+                    refreshed = fetch_plant_detail(detail_url, session=sess, include_photos=True)
+                    photos = refreshed.get("_photos") or []
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug("Failed to refresh plant detail for photos %s: %s", detail_url, exc)
+        if not photos:
+            logger.info("No MPDB photos found for %s", identifier)
+            continue
+        logger.info("Found %d MPDB photos for %s", len(photos), identifier)
+        downloaded = _download_photo_entries(photos, target_root / identifier, session=sess)
+        total_downloaded += downloaded
+    if total_downloaded:
+        logger.info("Downloaded %d MPDB photos", total_downloaded)
+    else:
+        logger.info("No MPDB photos downloaded")
+
+
+def _inat_prepare_candidate_names(names: Iterable[str]) -> List[str]:
+    tokens: List[str] = []
+    seen: Set[str] = set()
+    for raw in names:
+        if not raw:
+            continue
+        for fragment in re.split(r"[,;/|]+", str(raw)):
+            normalized = _normalise_text(fragment)
+            if not normalized:
+                continue
+            lowered = normalized.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            tokens.append(normalized)
+    return tokens
+
+
+def _inat_variant_from_name(name: str) -> List[str]:
+    base = _normalise_text(name)
+    if not base:
+        return []
+    variants: List[str] = [base]
+    stripped = re.sub(r"\([^)]*\)", "", base).strip()
+    if stripped and stripped not in variants:
+        variants.append(stripped)
+
+    without_authors = (
+        re.split(r"\b(?:var\.|subsp\.|ssp\.|f\.)\b", stripped, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    )
+    if without_authors and without_authors not in variants:
+        variants.append(without_authors)
+
+    token_list = without_authors.split()
+    if len(token_list) >= 2:
+        binomial = " ".join(token_list[:2])
+        if binomial and binomial not in variants:
+            variants.append(binomial)
+    if token_list:
+        genus = token_list[0]
+        if genus and genus not in variants:
+            variants.append(genus)
+    return variants
+
+
+def _inat_generate_name_variants(candidate_names: Iterable[str]) -> List[str]:
+    variants: List[str] = []
+    seen: Set[str] = set()
+    for name in candidate_names:
+        for variant in _inat_variant_from_name(name):
+            lowered = variant.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            variants.append(variant)
+    return variants
+
+
+def _inat_request_observations(
+    sess: requests.Session,
+    params: Dict[str, Any],
+    *,
+    query_name: str,
+) -> List[Dict[str, Any]]:
+    logger.info("Requesting iNaturalist observations for '%s' with params %s", query_name, params)
+    response = sess.get(INAT_OBSERVATIONS_ENDPOINT, params=params, timeout=30)
+    logger.info("iNaturalist request URL for '%s': %s", query_name, response.url)
+    response.raise_for_status()
+    payload = response.json()
+    return payload.get("results", [])
+
+
+def _fetch_inaturalist_photos_for_names(
+    names: Iterable[str],
+    *,
+    max_photos: int,
+    request_delay: float,
+    session: Optional[requests.Session] = None,
+) -> List[Dict[str, object]]:
+    sess = session or _create_session()
+    variants = _inat_generate_name_variants(_inat_prepare_candidate_names(names))
+    if not variants or max_photos <= 0:
+        return []
+
+    collected: List[Dict[str, object]] = []
+    seen: Set[Tuple[Optional[int], Optional[int]]] = set()
+    last_request: float = 0.0
+    per_page = min(100, max(20, max_photos * 2))
+
+    for variant in variants:
+        if len(collected) >= max_photos:
+            break
+        now = time.time()
+        if last_request and request_delay > 0 and now - last_request < request_delay:
+            time.sleep(request_delay - (now - last_request))
+        try:
+            results = _inat_request_observations(
+                sess,
+                {
+                    "taxon_name": variant,
+                    "photos": "true",
+                    "per_page": per_page,
+                    "order_by": "votes",
+                    "order": "desc",
+                },
+                query_name=variant,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("iNaturalist lookup failed for %s: %s", variant, exc)
+            continue
+        finally:
+            last_request = time.time()
+
+        for obs in results:
+            obs_id = obs.get("id")
+            for photo in obs.get("photos") or []:
+                photo_id = photo.get("id") or photo.get("photo_id")
+                key = (obs_id, photo_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                url = photo.get("url")
+                if not url:
+                    continue
+                full_url = url.replace("square", "medium")
+                file_name = Path(urllib.parse.urlparse(full_url).path).name
+                collected.append(
+                    {
+                        "observation_id": obs_id,
+                        "photo_id": photo_id,
+                        "thumbnail_url": url,
+                        "full_size_url": full_url,
+                        "file_name": file_name,
+                        "source": "inat",
+                    }
+                )
+                if len(collected) >= max_photos:
+                    break
+            if len(collected) >= max_photos:
+                break
+
+    return collected[:max_photos]
+
+
+def _download_inaturalist_photos(
+    entries: List[Dict[str, Any]],
+    target_root: Path,
+    *,
+    max_photos: int = INAT_DEFAULT_MAX_PHOTOS,
+    request_delay: float = INAT_DEFAULT_REQUEST_DELAY,
+    session: Optional[requests.Session] = None,
+) -> None:
+    sess = session or _create_session()
+    total_downloaded = 0
+    for entry in entries:
+        identifier = _derive_photo_identifier(entry)
+        candidate_names: List[str] = []
+        for field in ("Plant latin name", "Common name", "Crude drug latin name"):
+            value = _value_to_string(entry.get(field))
+            if value:
+                candidate_names.append(value)
+        if not candidate_names:
+            logger.info("Skipping iNaturalist photos for %s (no candidate names)", identifier)
+            continue
+        photos = _fetch_inaturalist_photos_for_names(
+            candidate_names,
+            max_photos=max_photos,
+            request_delay=request_delay,
+            session=sess,
+        )
+        if not photos:
+            logger.info("No iNaturalist photos found for %s (%s)", identifier, ", ".join(candidate_names))
+            continue
+        logger.info("Found %d iNaturalist photos for %s", len(photos), identifier)
+        downloaded = _download_photo_entries(photos, target_root / identifier, session=sess)
+        total_downloaded += downloaded
+    if total_downloaded:
+        logger.info("Downloaded %d iNaturalist photos", total_downloaded)
+    else:
+        logger.info("No iNaturalist photos downloaded")
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Standalone plant crawler for MPDB.")
+    default_output = Path(__file__).resolve().parent / "data" / "plants.csv"
+    default_photo_dir = Path(__file__).resolve().parent / "photos" / "plant"
+    parser.add_argument("--output", "-o", type=Path, default=default_output, help="CSV output file path.")
+    parser.add_argument("--photo-dir", "-p", type=Path, default=default_photo_dir, help="Directory to store photos.")
+    parser.add_argument("--limit", "-l", type=int, default=None, help="Limit number of plants to crawl.")
+    parser.add_argument("--delay", "-d", type=float, default=0.5, help="Delay between requests in seconds.")
+    parser.add_argument(
+        "--inat-max-photos",
+        type=int,
+        default=INAT_DEFAULT_MAX_PHOTOS,
+        help="Maximum iNaturalist photos to fetch per plant.",
+    )
+    parser.add_argument(
+        "--inat-delay",
+        type=float,
+        default=INAT_DEFAULT_REQUEST_DELAY,
+        help="Delay between iNaturalist requests in seconds.",
+    )
+    parser.add_argument(
+        "--skip-mpdb-photos",
+        action="store_true",
+        help="Skip downloading photos hosted on MPDB.",
+    )
+    parser.add_argument(
+        "--skip-inat-photos",
+        action="store_true",
+        help="Skip downloading photos from the iNaturalist API.",
+    )
+    parser.add_argument("-v", "--verbose", action="count", default=0, help="Increase log verbosity.")
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = _build_arg_parser().parse_args(argv)
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=log_level, format="%(asctime)s [%(levelname)s] %(message)s")
+
+    session = _create_session()
+    logger.info("Crawling MPDB plant entries...")
+    plant_entries, _, _ = crawl_plants(
+        limit=args.limit,
+        delay_seconds=max(0.0, args.delay),
+        session=session,
+        include_photos=not args.skip_mpdb_photos,
+    )
+    _write_plants_csv(args.output, plant_entries)
+    logger.info("Saved %d plant rows to %s", len(plant_entries), args.output)
+
+    if not args.skip_mpdb_photos:
+        logger.info("Downloading MPDB plant photos...")
+        _download_mpdb_photos(plant_entries, args.photo_dir / "mpdb", session=session)
+    if not args.skip_inat_photos:
+        logger.info("Downloading iNaturalist plant photos...")
+        _download_inaturalist_photos(
+            plant_entries,
+            args.photo_dir / "inat",
+            max_photos=max(0, int(args.inat_max_photos)),
+            request_delay=max(0.0, float(args.inat_delay)),
+            session=session,
+        )
+
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())
