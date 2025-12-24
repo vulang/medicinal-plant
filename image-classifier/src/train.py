@@ -11,6 +11,7 @@ from torch import amp
 from sklearn.metrics import f1_score
 import mlflow
 import mlflow.pytorch
+from mlflow.models import infer_signature
 
 try:
     from timm.data import Mixup
@@ -566,10 +567,33 @@ def main(cfg_path: str = "config.yaml"):
                 reg_model.load_state_dict(reg_ckpt["model_state"])
                 reg_model.eval()
 
+                # Build a minimal input_example and signature so MLflow can infer schema.
+                input_example = None
+                signature = None
+                try:
+                    data_cfg = getattr(reg_model, "data_config", {}) or {}
+                    input_size = data_cfg.get("input_size") if isinstance(data_cfg, dict) else None
+                    if not input_size:
+                        img_size = cfg.get("img_size")
+                        if isinstance(img_size, int):
+                            input_size = (3, img_size, img_size)
+                    if not input_size:
+                        input_size = (3, 224, 224)
+
+                    example_input = torch.zeros((1, *input_size), dtype=torch.float32)
+                    with torch.no_grad():
+                        example_output = reg_model(example_input)
+                    input_example = example_input.numpy()
+                    signature = infer_signature(input_example, example_output.detach().numpy())
+                except Exception as signature_exc:
+                    print(f"[WARN] Could not build MLflow input_example/signature: {signature_exc}")
+
                 # Log the model artifact first
                 mlflow.pytorch.log_model(
                     reg_model,
                     artifact_path=model_artifact_subdir,
+                    signature=signature,
+                    input_example=input_example,
                 )
                 artifact_uri = mlflow.get_artifact_uri(model_artifact_subdir)
 

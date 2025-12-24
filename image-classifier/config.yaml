@@ -9,7 +9,7 @@ img_size: 288
 batch_size: 24
 num_workers: 2
 
-model_name: convnextv2_base.fcmae_ft_in22k_in1k   # choices: convnextv2_base.fcmae_ft_in22k_in1k, swin_base_patch4_window7_224.ms_in22k
+model_name: convnextv2_base.fcmae_ft_in22k_in1k
 pretrained: true
 use_timm_augment: true   # set true to use timm's RandomResizedCrop-style augmentation (more aggressive)
 

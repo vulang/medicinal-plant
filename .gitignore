@@ -14,3 +14,5 @@ image-classifier/source_original/
 image-classifier/suspect_images/
 image-classifier/source-with-parts/
 image-classifier/image-classifier/data/removed-by-preprocessed
+image-classifier/mlartifacts/
+image-classifier/models/
