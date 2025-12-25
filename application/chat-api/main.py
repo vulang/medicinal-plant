@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from PIL import Image, UnidentifiedImageError
 import torch
 import torch.nn.functional as F
-from torchvision import models, transforms
+from torchvision import transforms
 import yaml
 
 try:
@@ -96,35 +96,14 @@ def _resolve_device(preferred: str = "auto") -> torch.device:
 
 
 def _build_model(model_name: str, num_classes: int, pretrained: bool = False) -> torch.nn.Module:
-    if model_name == "resnet18":
-        model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT if pretrained else None)
-        in_features = model.fc.in_features
-        model.fc = torch.nn.Linear(in_features, num_classes)
-        return model
-    if model_name == "resnet50":
-        model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT if pretrained else None)
-        in_features = model.fc.in_features
-        model.fc = torch.nn.Linear(in_features, num_classes)
-        return model
-    if model_name == "efficientnet_b0":
-        model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT if pretrained else None)
-        in_features = model.classifier[1].in_features
-        model.classifier[1] = torch.nn.Linear(in_features, num_classes)
-        return model
-    if model_name == "mobilenet_v3_small":
-        model = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT if pretrained else None)
-        in_features = model.classifier[3].in_features
-        model.classifier[3] = torch.nn.Linear(in_features, num_classes)
-        return model
-    # Fallback to timm for additional architectures used during training.
     if timm is None:
-        raise ValueError(
-            f"Unsupported model_name: {model_name}. Install timm to enable additional architectures."
-        )
-    try:
-        return timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes)
-    except Exception as exc:
-        raise ValueError(f"Unsupported model_name: {model_name}") from exc
+        raise ValueError("timm is required to build the supported models.")
+    if model_name not in {
+        "convnextv2_base.fcmae_ft_in22k_in1k",
+        "swin_base_patch4_window7_224.ms_in22k",
+    }:
+        raise ValueError(f"Unsupported model_name: {model_name}")
+    return timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes)
 
 
 def _build_inference_transform(img_size: int) -> transforms.Compose:
@@ -394,8 +373,8 @@ class PlantClassifierService:
                     continue
                 checkpoint_path = entry.get("checkpoint_path")
                 mlflow_cfg = entry.get("mlflow") if isinstance(entry, dict) else None
-                if mlflow_cfg and not mlflow_cfg.get("enabled", False):
-                    mlflow_cfg = None
+                if not (isinstance(mlflow_cfg, dict) and mlflow_cfg.get("enabled", False)):
+                    raise ValueError(f"MLflow configuration is required for model '{key}'.")
                 configs[key] = {
                     "model_name": model_name,
                     "img_size": int(img_size),
@@ -403,7 +382,7 @@ class PlantClassifierService:
                     "checkpoint_path": Path(checkpoint_path) if checkpoint_path else (
                         DEFAULT_MODELS_DIR / f"{model_name}_best.pt"
                     ),
-                    "mlflow": mlflow_cfg if mlflow_cfg else None,
+                    "mlflow": mlflow_cfg,
                 }
             if not configs:
                 raise ValueError("No valid models defined in config.")
@@ -414,8 +393,8 @@ class PlantClassifierService:
         img_size = self.cfg["img_size"]
         checkpoint_path_env = os.getenv("MODEL_CHECKPOINT_PATH")
         mlflow_cfg = self.cfg.get("mlflow")
-        if mlflow_cfg and not mlflow_cfg.get("enabled", False):
-            mlflow_cfg = None
+        if not (isinstance(mlflow_cfg, dict) and mlflow_cfg.get("enabled", False)):
+            raise ValueError("MLflow configuration is required for the default model.")
         checkpoint_path = Path(checkpoint_path_env) if checkpoint_path_env else (
             DEFAULT_MODELS_DIR / f"{model_name}_best.pt"
         )
@@ -425,7 +404,7 @@ class PlantClassifierService:
                 "img_size": int(img_size),
                 "device": device_default,
                 "checkpoint_path": checkpoint_path,
-                "mlflow": mlflow_cfg if mlflow_cfg else None,
+                "mlflow": mlflow_cfg,
             }
         }
 
@@ -448,17 +427,15 @@ class PlantClassifierService:
             return self.model_cache[model_key]
         cfg = self.model_configs[model_key]
         checkpoint_override = os.getenv("MODEL_CHECKPOINT_PATH")
-        if checkpoint_override and model_key == self.default_model_key:
-            cfg = {**cfg, "checkpoint_path": Path(checkpoint_override)}
-        checkpoint_path = cfg["checkpoint_path"]
-        mlflow_cfg = cfg.get("mlflow")
-        if mlflow_cfg:
-            try:
-                checkpoint_path = _download_mlflow_checkpoint(model_key, cfg, mlflow_cfg)
-            except HTTPException:
-                raise
-            except Exception as exc:
-                logger.warning("Falling back to local checkpoint after MLflow download failure: %s", exc)
+        if checkpoint_override:
+            logger.warning("Ignoring MODEL_CHECKPOINT_PATH because MLflow is required.")
+        mlflow_cfg = cfg["mlflow"]
+        try:
+            checkpoint_path = _download_mlflow_checkpoint(model_key, cfg, mlflow_cfg)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to download MLflow checkpoint: {exc}") from exc
         try:
             model = LoadedModel(
                 key=model_key,
